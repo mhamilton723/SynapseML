@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="dciborowMMLSpark",
-    version="0.0.22",
+    version="0.0.23",
     description="Microsoft ML for Spark",
     long_description="Microsoft ML for Apache Spark contains Microsoft's open source " +
                      "contributions to the Apache Spark ecosystem",
@@ -25,6 +25,7 @@ setup(
     ],
     
      packages=['mmlspark',
+               'mmlspark.recommendation',
                'mmlspark.jars'],
     include_package_data=True,
     package_dir={
