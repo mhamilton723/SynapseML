@@ -15,7 +15,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'pyspark'
-    ]
+    ],
     # Project's main homepage.
     url="https://github.com/Azure/mmlspark",
     # Author details
