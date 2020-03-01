@@ -26,13 +26,13 @@ setup(
     
      packages=['mmlspark',
                'mmlspark.recommendation',
-               'mmlspark.jars'],
+               'pyspark.jars'],
     include_package_data=True,
     package_dir={
-            'mmlspark.jars': 'deps/jars',
+            'pyspark.jars': 'deps/jars',
     },
     package_data={
-            'mmlspark.jars': ['*.jar']},
+            'pyspark.jars': ['*.jar']},
 
     install_requires=[
         "pyspark",
