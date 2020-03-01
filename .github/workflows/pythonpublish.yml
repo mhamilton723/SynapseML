@@ -24,5 +24,4 @@ jobs:
       run: |
         cd src/main/python
         python setup.py sdist bdist_wheel
-        pwd
-        ls
+        python -m twine upload dist/*
