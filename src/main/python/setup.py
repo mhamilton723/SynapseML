@@ -37,10 +37,3 @@ setup(
 
     package_data={"mmlspark": ["../LICENSE.txt", "../README.txt"]}
 )
-
-spark = SparkSession.builder \
-    .master("local[*]") \
-    .appName("Install MMLSpark") \
-    .config("spark.jars.packages", "com.microsoft.ml.spark:mmlspark_2.11:0.18.1") \
-    .config("spark.executor.heartbeatInterval", "60s") \
-    .getOrCreate()
