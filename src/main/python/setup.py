@@ -25,5 +25,9 @@ setup(
         "Programming Language :: Python :: 3"
     ],
 
+    install_requires=[
+        "pyspark"
+    ],
+
     zip_safe=True
 )
