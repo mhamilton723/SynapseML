@@ -21,10 +21,7 @@ setup(
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",
-        "Intended Audience :: Data Scientists",
-        "Topic :: Software Development :: Datascience Tools",
         "License :: OSI Approved :: MIT License",
-        "Programming Language :: Python :: 2",
         "Programming Language :: Python :: 3"
     ],
 
