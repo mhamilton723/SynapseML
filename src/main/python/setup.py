@@ -5,7 +5,7 @@ import os
 from setuptools import setup, find_packages
 
 setup(
-    name="dciborow-mmlspark-dev",
+    name="dciborowMMLSpark",
     version="0.0.1",
     description="Microsoft ML for Spark",
     long_description="Microsoft ML for Apache Spark contains Microsoft's open source " +
@@ -13,7 +13,7 @@ setup(
     license="MIT",
     packages=find_packages(),
     # Project's main homepage.
-    url="https://github.com/Azure/mmlspark",
+    url="https://github.com/dciborow/mmlspark",
     # Author details
     author="Microsoft",
     author_email="mmlspark-support@microsoft.com",
@@ -28,7 +28,5 @@ setup(
         "Programming Language :: Python :: 3"
     ],
 
-    zip_safe=True,
-
-    package_data={"mmlspark": ["../LICENSE.txt", "../README.txt"]}
+    zip_safe=True
 )
