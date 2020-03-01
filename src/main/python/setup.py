@@ -24,6 +24,15 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3"
     ],
+    
+     packages=['mmlspark',
+               'mmlspark.jars'],
+    include_package_data=True,
+    package_dir={
+            'mmlspark.jars': 'deps/jars',
+    },
+    package_data={
+            'mmlspark.jars': ['*.jar']},
 
     install_requires=[
         "pyspark",
