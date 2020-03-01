@@ -11,7 +11,6 @@ setup(
     long_description="Microsoft ML for Apache Spark contains Microsoft's open source " +
                      "contributions to the Apache Spark ecosystem",
     license="MIT",
-    packages=find_packages(),
     # Project's main homepage.
     url="https://github.com/dciborow/mmlspark",
     # Author details
