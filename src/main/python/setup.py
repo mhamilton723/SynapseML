@@ -4,6 +4,7 @@
 import os
 from setuptools import setup, find_packages
 import pyspark
+from pyspark.sql import SparkSession
 
 setup(
     name="dciborow-mmlspark-dev",
