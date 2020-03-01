@@ -8,7 +8,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2     
+    - uses: actions/checkout@v2
+    - name: SBT Action
+      uses: lokkju/github-action-sbt@v0.2.2
+      with:
+        # SBT commands
+        commands: compile        
     - name: Set up Python
       uses: actions/setup-python@v1
       with:
@@ -23,11 +28,5 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}      
       run: |
         cd src/main/python
-        
-        apt install unzip
-        unzip ./deps/jars/mmlspark_2.11-0.18.1.jar
-        
-        cp -ru /deps/jars/mmlspark_2.11-0.18.1/mmlspark/* ./mmlspark/
-        
         python setup.py sdist bdist_wheel
         python -m twine upload dist/*
