@@ -26,7 +26,8 @@ setup(
     ],
 
     install_requires=[
-        "pyspark"
+        "pyspark",
+        "numpy"
     ],
 
     zip_safe=True
