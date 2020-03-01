@@ -8,7 +8,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2     
+    - uses: actions/checkout@v2
+    - name: SBT Action
+      uses: lokkju/github-action-sbt@v0.2.2
+      with:
+        # SBT commands
+        commands: compile        
     - name: Set up Python
       uses: actions/setup-python@v1
       with:
