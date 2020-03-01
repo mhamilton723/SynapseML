@@ -26,6 +26,10 @@ setup(
     
      packages=['mmlspark',
                'mmlspark.recommendation',
+               'mmlspark.recommendation._RankingTrainValidationSplitModel',
+               'mmlspark.recommendation.RecommendationIndexer',
+               'mmlspark.recommendation.RankingEvaluator',
+               'mmlspark.recommendation.RankingAdapter',
                'mmlspark.jars'],
     include_package_data=True,
     package_dir={
