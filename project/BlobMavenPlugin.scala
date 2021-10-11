@@ -22,7 +22,7 @@ object BlobMavenPlugin extends AutoPlugin {
   override lazy val projectSettings: Seq[Setting[_]] = Seq(
     publishBlob := {
       publishM2.value
-      //TODO make this more general - 1.0 is a hack and not sure of a way to get this with sbt keys  
+      //TODO make this more general - 1.0 is a hack and not sure of a way to get this with sbt keys
       val sourceArtifactName = s"${moduleName.value}_${scalaBinaryVersion.value}_1.0"
       val destArtifactName = s"${moduleName.value}"
       val repositoryDir = new File(new URI(Resolver.mavenLocal.root))
