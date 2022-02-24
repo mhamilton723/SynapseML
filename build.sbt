@@ -19,7 +19,7 @@ val scalaMajorVersion = 2.12
 val excludes = Seq(
   ExclusionRule("org.apache.spark", s"spark-tags_$scalaMajorVersion"),
   ExclusionRule("org.scalatest")
-)
+) 
 
 val coreDependencies = Seq(
   "org.apache.spark" %% "spark-core" % sparkVersion % "compile",
