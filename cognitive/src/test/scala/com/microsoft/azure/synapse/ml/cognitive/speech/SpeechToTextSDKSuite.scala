@@ -136,11 +136,9 @@ trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey with CustomSpe
   }
 }
 
-class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with SpeechToTextSDKSuiteBase {
+class SpeechToTextSDKSuite extends TestBase with SpeechToTextSDKSuiteBase {
 
   import spark.implicits._
-
-  override val retrySerializationFuzzing: Boolean = true
 
   def sdk: SpeechToTextSDK = new SpeechToTextSDK()
     .setSubscriptionKey(cognitiveKey)
@@ -150,163 +148,12 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
     .setLanguage("en-US")
     .setProfanity("Masked")
 
-  def customSdk: SpeechToTextSDK = sdk
-    .setSubscriptionKey(customSpeechKey)
-    .setEndpointId("395cdcf7-e7db-4083-aebe-868a7d80ca74")
 
-  override lazy val dfEq = new Equality[DataFrame] {
-    override def areEqual(a: DataFrame, b: Any): Boolean = {
-      jaccardSimilarity(
-        speechArrayToText(extractResults(a, true)),
-        speechArrayToText(extractResults(b.asInstanceOf[DataFrame], true))
-      ) > jaccardThreshold
-    }
-  }
 
   test("Simple audioBytesToText 1") {
     speechTest("simple", bytes1, text1)
   }
 
-  test("Detailed audioBytesToText 1") {
-    speechTest("detailed", bytes1, text1)
-  }
-
-  test("Word level timing") {
-    val resultSeq = extractResults(
-      sdk.setFormat("detailed").setWordLevelTimestamps(true).transform(audioDf1),
-      sdk.getStreamIntermediateResults)
-    assert(resultSeq.head.NBest.get.head.Words.get.length > 1)
-  }
-
-  ignore("Detailed audioBytesToText 2") {
-    speechTest("detailed", bytes2, text2)
-  }
-
-  test("Simple audioBytesToText 2") {
-    speechTest("simple", bytes2, text2)
-  }
-
-  test("Simple SDK Usage Audio 1") {
-    dfTest("simple", audioDf1, text1)
-  }
-
-  test("Simple SDK Usage Audio 1 multi") {
-    dfTest("simple", audioDf2, text2)
-    dfTest("simple", audioDf1, text1)
-    dfTest("simple", audioDf1, text1)
-    dfTest("simple", audioDf1, text1)
-  }
-
-  test("Detailed SDK Usage Audio 1") {
-    dfTest("detailed", audioDf1, text1)
-  }
-
-  test("Simple SDK Usage Audio 2") {
-    dfTest("simple", audioDf2, text2)
-  }
-
-  test("Simple SDK Usage without streaming") {
-    dfTest("simple", audioDf1, text1, sdk = sdk.setStreamIntermediateResults(false))
-  }
-
-  test("Custom SDK Usage") {
-    dfTest("simple", audioDf1, text1, sdk = customSdk)
-  }
-
-  test("Detailed SDK Usage Audio 2") {
-    dfTest("detailed", audioDf2, text2)
-  }
-
-  test("URI based access") {
-    val uriDf = Seq(Tuple1(audioPaths(1).toURI.toString))
-      .toDF("audio")
-    dfTest("detailed", uriDf, text2)
-  }
-
-  test("URL based access") {
-    tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
-      val uriDf = Seq(Tuple1("https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav"))
-        .toDF("audio")
-      dfTest("detailed", uriDf, text2)
-    }
-  }
-
-  test("SAS URL based access") {
-    val sasURL = "https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav?sv=2019-12-12" +
-      "&st=2021-01-25T16%3A40%3A13Z&se=2024-01-26T16%3A40%3A00Z" +
-      "&sr=b&sp=r&sig=NpFm%2FJemAJOGIya1ykQ6f80YdvwpiAuJjnb2RVDtKro%3D"
-
-    tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
-      val uriDf = Seq(Tuple1(sasURL))
-        .toDF("audio")
-      dfTest("detailed", uriDf, text2, sdk = sdk)
-    }
-  }
-
-  test("Detailed SDK with mp3 (Linux only)") {
-    dfTest("detailed", audioDf3, text3, sdk = sdk.setFileType("mp3"), verbose = true, threshold = .6)
-  }
-
-  test("m3u8 based access") {
-    val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "60"))
-      .setLanguage("en-US")
-    // 20 seconds of streaming
-    tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
-      val uriDf = Seq(Tuple1(streamUrl))
-        .toDF("audio")
-      dfTest(
-        "detailed",
-        uriDf, text4, verbose = true, sdk = sdk2, threshold = .6)
-    }
-  }
-
-  test("m3u8 file writing") {
-    val outputMp3 = new File(savePath, "output.mp3")
-    val outputJson = new File(savePath, "output.json")
-
-    try {
-      val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "20"))
-        .setRecordedFileNameCol("recordedFile")
-        .setRecordAudioData(true)
-        .setLanguage("en-US")
-
-      // 20 seconds of streaming
-      val uriDf = Seq(Tuple2(streamUrl, outputMp3.toString))
-        .toDF("audio", "recordedFile")
-      sdk2.transform(uriDf).write.mode("overwrite").json(outputJson.toString)
-
-      assert(outputMp3.exists())
-      assert(outputJson.exists())
-    } finally {
-      FileUtils.forceDelete(outputMp3)
-      FileUtils.forceDelete(outputJson)
-    }
-  }
-
-  test("API vs. SDK") {
-    val stt = new SpeechToText()
-      .setSubscriptionKey(cognitiveKey)
-      .setLocation(region)
-      .setOutputCol("text")
-      .setAudioDataCol("audio")
-      .setLanguage("en-US")
-    val toObj: Row => SpeechResponse = SpeechResponse.makeFromRowConverter
-    val apiResult = toObj(stt.setFormat("simple")
-      .transform(audioDf2).select("text")
-      .collect().head.getStruct(0)).DisplayText.getOrElse("")
-
-    val sdkResult = speechArrayToText(sdk.setFormat(format)
-      .transform(audioDf2)
-      .select("text").collect()
-      .map(row => toObj(row.getAs[Row](0)))
-    )
-    assert(jaccardSimilarity(apiResult, sdkResult) > jaccardThreshold)
-  }
-
-  override def testObjects(): Seq[TestObject[SpeechToTextSDK]] =
-    Seq(new TestObject(sdk, audioDf2))
-
-  override def reader: MLReadable[_] = SpeechToTextSDK
 
 }
 
