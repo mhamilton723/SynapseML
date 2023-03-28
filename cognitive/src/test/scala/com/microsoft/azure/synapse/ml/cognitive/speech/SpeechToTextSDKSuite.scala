@@ -138,8 +138,6 @@ trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey with CustomSpe
 
 class SpeechToTextSDKSuite extends TestBase with SpeechToTextSDKSuiteBase {
 
-  import spark.implicits._
-
   def sdk: SpeechToTextSDK = new SpeechToTextSDK()
     .setSubscriptionKey(cognitiveKey)
     .setLocation(region)
@@ -148,12 +146,9 @@ class SpeechToTextSDKSuite extends TestBase with SpeechToTextSDKSuiteBase {
     .setLanguage("en-US")
     .setProfanity("Masked")
 
-
-
   test("Simple audioBytesToText 1") {
     speechTest("simple", bytes1, text1)
   }
-
 
 }
 

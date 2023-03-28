@@ -378,6 +378,7 @@ abstract class SpeechSDKBase extends Transformer
       speechConfig.requestWordLevelTimestamps()
     }
     speechConfig.setProperty(PropertyId.SpeechServiceResponse_OutputFormatOption, format) //scalastyle:ignore token
+    speechConfig.setProperty(PropertyId.Speech_LogFilename, "/tmp/speech_log.txt")
     speechConfig
   }
 
@@ -464,6 +465,8 @@ class SpeechToTextSDK(override val uid: String) extends SpeechSDKBase with Synap
     val audioConfig = AudioConfig.fromStreamInput(pullStream)
     val recognizer = new SpeechRecognizer(speechConfig, audioConfig)
     val connection = Connection.fromRecognizer(recognizer)
+
+
     connection.setMessageProperty("speech.config", "application",
       s"""{"name":"synapseml", "version": "${BuildInfo.version}"}""")
     val queue = new LinkedBlockingQueue[Option[String]]()
