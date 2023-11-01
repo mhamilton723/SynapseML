@@ -75,6 +75,7 @@ object SynapseExtensionUtilities {
     val store = Secrets.ArtifactStore.capitalize
     val excludes: String = "org.scala-lang:scala-reflect," +
       "org.apache.spark:spark-tags_2.12," +
+      "org.scalactic:scalactic_2.12," +
       "org.scalatest:scalatest_2.12," +
       "org.slf4j:slf4j-api"
 
@@ -83,7 +84,7 @@ object SynapseExtensionUtilities {
          |"{
          |  'Default${store}ArtifactId': '$storeId',
          |  'ExecutableFile': '$path',
-         |  'SparkVersion':'3.4',
+         |  'SparkVersion':'3.3',
          |  'SparkSettings': {
          |    'spark.jars.packages' : '$SparkMavenPackageList',
          |    'spark.jars.repositories' : '$SparkMavenRepositoryList',

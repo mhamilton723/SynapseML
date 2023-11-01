@@ -68,6 +68,7 @@ class HTTPSourceTable(options: CaseInsensitiveStringMap)
     override def readSchema(): StructType = HTTPSourceV2.Schema
 
     override def toMicroBatchStream(checkpointLocation: String): MicroBatchStream = {
+      logInfo("Creating Microbatch reader")
       new HTTPMicroBatchReader(continuous = false, options = options)
     }
 
@@ -135,8 +136,8 @@ private[streaming] object DriverServiceUtils {
                                       host: String,
                                       handler: HttpHandler): HttpServer = {
     val port: Int = StreamUtilities.using(new ServerSocket(0))(_.getLocalPort).get
-    val server = HttpServer.create(new InetSocketAddress(host, port), 100) //scalastyle:ignore magic.number
-    server.setExecutor(Executors.newFixedThreadPool(100)) //scalastyle:ignore magic.number
+    val server = HttpServer.create(new InetSocketAddress(host, port), 100)  //scalastyle:ignore magic.number
+    server.setExecutor(Executors.newFixedThreadPool(100))  //scalastyle:ignore magic.number
     server.createContext(s"/$path", handler)
     server.start()
     server
@@ -207,10 +208,10 @@ private[streaming] class HTTPMicroBatchReader(continuous: Boolean, options: Case
 
   val numPartitions: Int = options.getInt(HTTPSourceV2.NumPartitions, 2)
   val host: String = options.get(HTTPSourceV2.Host, "localhost")
-  val port: Int = options.getInt(HTTPSourceV2.Port, 8888) //scalastyle:ignore magic.number
+  val port: Int = options.getInt(HTTPSourceV2.Port, 8888)  //scalastyle:ignore magic.number
   val path: String = options.get(HTTPSourceV2.Path)
   val name: String = options.get(HTTPSourceV2.NAME)
-  val epochLength: Long = options.getLong(HTTPSourceV2.EpochLength, 30000) //scalastyle:ignore magic.number
+  val epochLength: Long = options.getLong(HTTPSourceV2.EpochLength, 30000)  //scalastyle:ignore magic.number
 
   val forwardingOptions: collection.Map[String, String] = options.asCaseSensitiveMap().asScala
     .filter { case (k, _) => k.startsWith("forwarding") }
@@ -269,9 +270,8 @@ private[streaming] class HTTPMicroBatchReader(continuous: Boolean, options: Case
 
     val config = WorkerServiceConfig(host, port, path, forwardingOptions,
       DriverServiceUtils.getDriverHost, driverService.getAddress.getPort, epochLength)
-
     Range(0, numPartitions).map { i =>
-      HTTPInputPartition(continuous, name, config, startMap(i), endMap.map(_(i)), i)
+      HTTPInputPartition(continuous, name, config, startMap(i), endMap.map(_ (i)), i)
         : InputPartition
     }.toArray
   }
@@ -318,7 +318,7 @@ private[streaming] class HTTPContinuousReader(options: CaseInsensitiveStringMap)
   }
 
   override def planInputPartitions(start: Offset): Array[InputPartition] =
-    planInputPartitions(start, null) //scalastyle:ignore null
+    planInputPartitions(start, null)  //scalastyle:ignore null
 
   override def createContinuousReaderFactory(): ContinuousPartitionReaderFactory = {
     HTTPSourceReaderFactory
@@ -332,13 +332,7 @@ private[streaming] case class HTTPInputPartition(continuous: Boolean,
                                                  endValue: Option[Long],
                                                  partitionIndex: Int
                                                 )
-  extends InputPartition {
-  if (!HTTPSourceStateHolder.hasServer(name)) {
-    val client = HTTPSourceStateHolder.getOrCreateClient(name)
-    HTTPSourceStateHolder.getOrCreateServer(name, startValue - 1, partitionIndex, continuous, client, config)
-  }
-
-}
+  extends InputPartition
 
 object HTTPSourceStateHolder {
 
@@ -385,10 +379,6 @@ object HTTPSourceStateHolder {
 
   private[streaming] def getServer(name: String): WorkerServer = {
     HTTPSourceStateHolder.Servers(name)
-  }
-
-  private[streaming] def hasServer(name: String): Boolean = {
-    HTTPSourceStateHolder.Servers.contains(name)
   }
 
   private[streaming] def getOrCreateServer(name: String,
@@ -497,10 +487,10 @@ private[streaming] class WorkerServer(val name: String,
 
   def registerPartition(localEpoch: Epoch, partitionId: PID): Unit = synchronized {
     if (!registeredPartitions.contains(partitionId)) {
-      logDebug(s"registering $partitionId localEpoch:$localEpoch globalEpoch:$epoch")
+      logInfo(s"registering $partitionId localEpoch:$localEpoch globalEpoch:$epoch")
       registeredPartitions.update(partitionId, localEpoch)
     } else {
-      logDebug(s"re-registering $partitionId localEpoch:$localEpoch globalEpoch:$epoch")
+      logInfo(s"re-registering $partitionId localEpoch:$localEpoch globalEpoch:$epoch")
       val previousEpoch = registeredPartitions(partitionId)
       registeredPartitions.update(partitionId, localEpoch)
       //there has been a failed partition and we need to rehydrate the queue
@@ -524,16 +514,14 @@ private[streaming] class WorkerServer(val name: String,
   @GuardedBy("this")
   private val historyQueues = new mutable.HashMap[(Epoch, PID), mutable.ListBuffer[CachedRequest]]
 
-  @GuardedBy("this")
   private[streaming] val recoveredPartitions = new mutable.HashMap[(Epoch, PID), LinkedBlockingQueue[CachedRequest]]
 
   private class PublicHandler extends HttpHandler {
     override def handle(request: HttpExchange): Unit = {
-      logDebug(s"handling request epoch: $epoch")
+      logDebug(s"handling epoch: $epoch")
       val uuid = UUID.randomUUID().toString
       val cReq = new CachedRequest(request, uuid)
       requestQueues(epoch).put(cReq)
-      logDebug(s"handled request epoch: $epoch")
     }
   }
 
@@ -552,7 +540,6 @@ private[streaming] class WorkerServer(val name: String,
           None
         }
         .foreach { request =>
-          logDebug(s"Replying to request")
           HTTPServerUtils.respond(request.e, data)
           request.e.close()
           routingTable.remove(id)
@@ -595,7 +582,7 @@ private[streaming] class WorkerServer(val name: String,
     }
     try {
       val server = HttpServer.create(new InetSocketAddress(InetAddress.getByName(host), startingPort),
-        100) //scalastyle:ignore magic.number
+                            100)  //scalastyle:ignore magic.number
       (server, startingPort)
     } catch {
       case _: java.net.BindException =>
@@ -637,24 +624,22 @@ private[streaming] class WorkerServer(val name: String,
       }
 
       timeout.map {
-          case Left(0L) => Option(queue.poll())
-          case Right(t) =>
-            val polled = queue.poll(t, TimeUnit.MILLISECONDS)
-            Option(polled).orElse {
-              synchronized {
-                //If the queue times out then we move to the next epoch
-                epoch += 1
-                val lbq = new LinkedBlockingQueue[CachedRequest]()
-                requestQueues.update(epoch, lbq)
-                epochStart = System.currentTimeMillis()
-              }
+        case Left(0L) => Option(queue.poll())
+        case Right(t) =>
+          Option(queue.poll(t, TimeUnit.MILLISECONDS)).orElse {
+            synchronized {
+              //If the queue times out then we move to the next epoch
+              epoch += 1
+              val lbq = new LinkedBlockingQueue[CachedRequest]()
+              requestQueues.update(epoch, lbq)
+              epochStart = System.currentTimeMillis()
               None
             }
-
-          case _ => throw new IllegalArgumentException("Should not hit this path")
-        }
-        .orElse(Some(Some(queue.take())))
-        .flatten
+          }
+        case _ => throw new IllegalArgumentException("Should not hit this path")
+      }
+      .orElse(Some(Some(queue.take())))
+      .flatten
     }
   }
 
@@ -665,8 +650,7 @@ private[streaming] class WorkerServer(val name: String,
         if (TaskContext.get().attemptNumber() == 0) {
           // If the request has never been materialized add it to the cache, otherwise we are in a retry and
           // should not modify the history
-          historyQueues
-            .getOrElseUpdate((localEpoch, partitionIndex), new ListBuffer[CachedRequest]())
+          historyQueues.getOrElseUpdate((localEpoch, partitionIndex), new ListBuffer[CachedRequest]())
             .append(request)
         }
         InternalRow(
@@ -718,6 +702,7 @@ private[streaming] class HTTPInputPartitionReader(continuous: Boolean,
                                                   val endEpoch: Option[Long],
                                                   val partitionIndex: Int)
   extends ContinuousPartitionReader[InternalRow] with Logging {
+
   val client: WorkerClient = HTTPSourceStateHolder.getOrCreateClient(name)
   val server: WorkerServer = HTTPSourceStateHolder.getOrCreateServer(
     name, startEpoch, partitionIndex, continuous, client, config)

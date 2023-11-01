@@ -98,7 +98,7 @@ class PatchedImageFileFormat extends ImageFileFormat with Serializable with Logg
         Iterator(emptyUnsafeRow)
       } else {
         val origin = file.filePath
-        val path = new Path(origin.toString())
+        val path = new Path(origin)
         val fs = path.getFileSystem(broadcastedHadoopConf.value.value)
         val stream = fs.open(path)
         val bytes = try {
@@ -107,12 +107,11 @@ class PatchedImageFileFormat extends ImageFileFormat with Serializable with Logg
           IOUtils.close(stream)
         }
 
-        val resultOpt = catchFlakiness(5)( //scalastyle:ignore magic.number
-          ImageSchema.decode(origin.toString(), bytes))
+        val resultOpt = catchFlakiness(5)(ImageSchema.decode(origin, bytes))  //scalastyle:ignore magic.number
         val filteredResult = if (imageSourceOptions.dropInvalid) {
           resultOpt.toIterator
         } else {
-          Iterator(resultOpt.getOrElse(ImageSchema.invalidImageRow(origin.toString())))
+          Iterator(resultOpt.getOrElse(ImageSchema.invalidImageRow(origin)))
         }
 
         if (requiredSchema.isEmpty) {

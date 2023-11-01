@@ -20,13 +20,10 @@ import java.io.File
 import java.util.UUID
 import scala.concurrent.{Await, Future}
 import scala.util.Try
-import org.apache.log4j.{LogManager, Level}
 
 // scalastyle:off null
-class HTTPv2Suite extends TestBase
-  with Flaky
-  with HTTPTestUtils {
-
+class HTTPv2Suite extends TestBase with Flaky with HTTPTestUtils {
+  //override val logLevel: String = "INFO"
 
   override def beforeAll(): Unit = {
     TestBase.resetSparkSession(numRetries = 20)
@@ -62,10 +59,10 @@ class HTTPv2Suite extends TestBase
       .format(classOf[HTTPSinkProviderV2].getName)
       .option("name", apiName)
       .queryName(name).option("checkpointLocation",
-        new File(tmpDir.toFile, s"checkpoints-${UUID.randomUUID()}").toString)
+      new File(tmpDir.toFile, s"checkpoints-${UUID.randomUUID()}").toString)
   }
 
-  def waitForBuild(): Unit = Thread.sleep(3000)
+  def waitForBuild(): Unit =Thread.sleep(3000)
 
   def basePipeline(numPartitions: Int = 4,
                    name: String = "foo",
@@ -156,11 +153,11 @@ class HTTPv2Suite extends TestBase
     using(server) {
       waitForServer(server)
       sendStringRequest(url = url(newPort))
-      //      val responsesWithLatencies = (1 to 100).map(_ => sendStringRequest(client, url = url(newPort)))
-      //      Thread.sleep(1000)
-      //      (1 to 100).foreach(_ => sendStringRequest(client, url = url(newPort)))
-      //      assertLatency(responsesWithLatencies, 20)
-      //      println(HTTPSourceStateHolder.serviceInfoJson(apiName))
+//      val responsesWithLatencies = (1 to 100).map(_ => sendStringRequest(client, url = url(newPort)))
+//      Thread.sleep(1000)
+//      (1 to 100).foreach(_ => sendStringRequest(client, url = url(newPort)))
+//      assertLatency(responsesWithLatencies, 20)
+//      println(HTTPSourceStateHolder.serviceInfoJson(apiName))
     }
 
   }
@@ -248,7 +245,7 @@ class HTTPv2Suite extends TestBase
       )
 
       val r2 = (1 to 10).map(i =>
-        sendStringRequest(payload = """{"valu111e": 1}""", targetCode = 400, url = url(newPort))
+        sendStringRequest(payload = """{"valu111e": 1}""",targetCode = 400, url = url(newPort))
       )
 
       val r3 = (1 to 10).map(i =>
@@ -422,7 +419,7 @@ class HTTPv2Suite extends TestBase
       lazy val client2: CloseableHttpClient = HttpClientBuilder
         .create().setDefaultRequestConfig(requestConfig2).build()
 
-      val futures = (1 to 100).map(i => Future(sendFileRequest(client = client2, url = url(newPort))))
+      val futures = (1 to 100).map(i => Future(sendFileRequest(client=client2, url = url(newPort))))
       val responsesWithLatencies = futures.flatMap(f => Try(Await.result(f, requestDuration)).toOption)
       Thread.sleep(6000)
       assert(server.isActive)

@@ -21,7 +21,6 @@ import spray.json.{JsArray, JsObject, JsValue, _}
 import java.io.{File, FileInputStream}
 import java.time.LocalDateTime
 import java.util.concurrent.{TimeUnit, TimeoutException}
-import scala.collection.immutable.Map
 import scala.collection.mutable
 import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, ExecutionContext, Future, blocking}
@@ -30,11 +29,11 @@ object DatabricksUtilities {
 
   // ADB Info
   val Region = "eastus"
-  val PoolName = "synapseml-build-13.3"
-  val GpuPoolName = "synapseml-build-13.3-gpu"
-  val AdbRuntime = "13.3.x-scala2.12"
-  // https://docs.databricks.com/en/release-notes/runtime/13.3lts-ml.html
-  val AdbGpuRuntime = "13.3.x-gpu-ml-scala2.12"
+  val PoolName = "synapseml-build-12.2"
+  val GpuPoolName = "synapseml-build-12.2-gpu"
+  val AdbRuntime = "12.2.x-scala2.12"
+  // https://learn.microsoft.com/en-us/azure/databricks/release-notes/runtime/
+  val AdbGpuRuntime = "12.2.x-gpu-ml-scala2.12"
   val NumWorkers = 5
   val AutoTerminationMinutes = 15
 
@@ -62,12 +61,11 @@ object DatabricksUtilities {
     "langchain",
     "pdf2image",
     "pdfminer.six",
+    "pytesseract",
+    "unstructured",
     "sqlparse",
     "raiwidgets",
-    "interpret-community",
-    "numpy==1.22.4",
-    "unstructured==0.10.24",
-    "pytesseract"
+    "interpret-community"
   )
 
   def baseURL(apiVersion: String): String = s"https://$Region.azuredatabricks.net/api/$apiVersion/"
@@ -82,9 +80,9 @@ object DatabricksUtilities {
     Map("maven" -> Map("coordinates" -> PackageMavenCoordinate, "repo" -> PackageRepository)),
     Map("pypi" -> Map("package" -> "pytorch-lightning==1.5.0")),
     Map("pypi" -> Map("package" -> "torchvision==0.14.1")),
-    Map("pypi" -> Map("package" -> "transformers==4.32.1")),
-    Map("pypi" -> Map("package" -> "petastorm==0.12.0")),
-    Map("pypi" -> Map("package" -> "protobuf==3.20.3"))
+    Map("pypi" -> Map("package" -> "transformers==4.25.1")),
+    Map("pypi" -> Map("package" -> "petastorm==0.12.1")),
+    Map("pypi" -> Map("package" -> "protobuf==3.19.4"))
   ).toJson.compactPrint
 
   val GPUInitScripts: String = List(
@@ -181,7 +179,7 @@ object DatabricksUtilities {
                           sparkVersion: String,
                           numWorkers: Int,
                           poolId: String,
-                          initScripts: String = "[]"): String = {
+                          initScripts: String): String = {
     val body =
       s"""
          |{
