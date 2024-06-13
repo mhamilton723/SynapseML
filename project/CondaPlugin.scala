@@ -31,7 +31,7 @@ object CondaPlugin extends AutoPlugin {
       val hasEnv = Process("conda env list").lineStream.toList
         .map(_.split("\\s+").head).contains(condaEnvName)
       if (!hasEnv) {
-        runCmd(Seq("conda", "env", "create", "-f", "environment.yml"))
+        runCmd(Seq("conda", "env", "create", "--file", "environment.yml"))
       } else {
         println("Found conda env " + condaEnvName)
       }
