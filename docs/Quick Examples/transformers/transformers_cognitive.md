@@ -25,11 +25,6 @@ import FormRecognizer, {toc as FormRecognizerTOC} from './cognitive/_FormRecogni
 <FormRecognizer/>
 
 
-import AnomalyDetection, {toc as AnomalyDetectionTOC} from './cognitive/_AnomalyDetection.md';
-
-<AnomalyDetection/>
-
-
 import Face, {toc as FaceTOC} from './cognitive/_Face.md';
 
 <Face/>
@@ -45,11 +40,6 @@ import AzureSearch, {toc as AzureSearchTOC} from './cognitive/_AzureSearch.md';
 <AzureSearch/>
 
 
-import BingImageSearch, {toc as BingImageSearchTOC} from './cognitive/_BingImageSearch.md';
-
-<BingImageSearch/>
-
-
 export const toc = [...TextAnalyticsTOC, ...TranslatorTOC, ...ComputerVisionTOC,
-...FormRecognizerTOC, ...AnomalyDetectionTOC, ...FaceTOC, ...SpeechToTextTOC,
-...AzureSearchTOC, ...BingImageSearchTOC]
+...FormRecognizerTOC, ...FaceTOC, ...SpeechToTextTOC,
+...AzureSearchTOC]

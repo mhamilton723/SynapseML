@@ -7,6 +7,7 @@ import com.microsoft.azure.synapse.ml.core.env.FileUtilities
 import com.microsoft.azure.synapse.ml.core.serialize.ComplexParam
 import com.microsoft.azure.synapse.ml.param._
 import org.apache.commons.lang.StringEscapeUtils
+import org.apache.spark.ml.classification.{ProbabilisticClassificationModel, ProbabilisticClassifier}
 import org.apache.spark.ml.evaluation.Evaluator
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.{Estimator, Model, Transformer}
@@ -14,7 +15,7 @@ import org.apache.spark.ml.{Estimator, Model, Transformer}
 import scala.reflect.runtime.universe._
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
-
+import java.util.WeakHashMap
 
 trait BaseWrappable extends Params {
 
@@ -27,17 +28,14 @@ trait BaseWrappable extends Params {
 
   protected lazy val classNameHelper: String = thisStage.getClass.getName.split(".".toCharArray).last
 
-
   protected def companionModelClassName: String = {
     val symbol = scala.reflect.runtime.currentMirror.classSymbol(thisStage.getClass)
-
     val superClassSymbol = symbol.baseClasses
       .find(s => Set("Estimator", "ProbabilisticClassifier", "Predictor", "BaseRegressor", "Ranker")
         .contains(s.name.toString))
       .getOrElse(throw new NoSuchElementException("Matching superclass was not found: " + symbol.baseClasses))
 
     val typeArgs = symbol.toType.baseType(superClassSymbol).typeArgs
-
     val modelTypeArg = superClassSymbol.name.toString match {
       case "Estimator" => typeArgs.head
       case _ => typeArgs.last
@@ -50,12 +48,32 @@ trait BaseWrappable extends Params {
   def getParamInfo(p: Param[_]): ParamInfo[_] = {
     DefaultParamInfo.defaultGetParamInfo(thisStage, p)
   }
+}
 
+private[codegen] object PythonStubCodegen {
+  private val TypeInfoByStage = new WeakHashMap[Params, Map[String, PythonTypeInfo]]()
+
+  def pythonTypeInfo(stage: Params, param: Param[_]): PythonTypeInfo = synchronized {
+    val typeInfoByName = Option(TypeInfoByStage.get(stage)).getOrElse {
+      val computed = stage.params
+        .map(p => p.name -> DefaultParamInfo.defaultPythonTypeInfo(stage, p))
+        .toMap
+      TypeInfoByStage.put(stage, computed)
+      computed
+    }
+    typeInfoByName.getOrElse(param.name, DefaultParamInfo.defaultPythonTypeInfo(stage, param))
+  }
 }
 
 trait PythonWrappable extends BaseWrappable {
 
   import GenerationUtils._
+  import PythonMethodExtractor.{Method, MethodPattern, pythonIdentifier}
+
+  private def getPythonTypeInfo(p: Param[_]): PythonTypeInfo =
+    PythonStubCodegen.pythonTypeInfo(thisStage, p)
+
+  protected def pyParamInputType(p: Param[_]): Option[String] = None
 
   def pyAdditionalMethods: String = {
     ""
@@ -80,13 +98,32 @@ trait PythonWrappable extends BaseWrappable {
     }
   }
 
+  private lazy val pySparkParamMixins: Seq[String] = thisStage match {
+    case _: ProbabilisticClassifier[_, _, _] | _: ProbabilisticClassificationModel[_, _] =>
+      Seq("HasRawPredictionCol")
+    case _ => Seq.empty
+  }
+
+  private lazy val pySparkParamMixinImports: String =
+    pySparkParamMixins.map(name => s"from pyspark.ml.param.shared import $name").mkString("\n")
+
   protected lazy val pyInheritedClasses: Seq[String] =
-    Seq("ComplexParamsMixin", "JavaMLReadable", "JavaMLWritable", pyObjectBaseClass)
+    Seq("ComplexParamsMixin", "JavaMLReadable", "JavaMLWritable") ++
+      pySparkParamMixins :+ pyObjectBaseClass
+
+  private def safeGetDefault[T](p: Param[T]): Option[T] = {
+    try {
+      thisStage.getDefault(p)
+    } catch {
+      case _: IllegalArgumentException =>
+        None
+    }
+  }
 
   // TODO add default values
   protected lazy val pyClassDoc: String = {
     val argLines = thisStage.params.map { p =>
-      s"""${p.name} (${getParamInfo(p).pyType}): ${p.doc}"""
+      s"""${p.name} (${pyParamInputType(p).getOrElse(getPythonTypeInfo(p).pyType)}): ${p.doc}"""
     }.mkString("\n")
     s"""|"\""
         |Args:
@@ -113,9 +150,25 @@ trait PythonWrappable extends BaseWrappable {
       }
     }.mkString("\n")
   }
-
+  private def hasPublicStageMethod(name: String, parameterCount: Int): Boolean =
+    thisStage.getClass.getMethods.exists(method =>
+      method.getName == name && method.getParameterCount == parameterCount)
+  private def validateServiceParamAliases(): Unit = {
+    val paramNames = thisStage.params.map(p => pythonIdentifier(p.name)).toSet
+    val additionalMethods = PythonMethodExtractor.extract(pyAdditionalMethods).map(m => pythonIdentifier(m.name)).toSet
+    thisStage.params.collect { case p: ServiceParam[_] => p }.foreach { p =>
+      val capName = p.name.capitalize
+      val alias = s"${p.name}Col"
+      require(!paramNames.contains(pythonIdentifier(alias)),
+        s"Service parameter ${p.name} cannot use Python alias $alias because that Param already exists")
+      Seq(s"get${capName}Col", s"set${capName}Col").foreach { methodName =>
+        require(!additionalMethods(pythonIdentifier(methodName)),
+          s"Generated Python method $methodName conflicts with a hand-written method")
+      }
+    }
+  }
   protected def pyParamArg[T](p: Param[T]): String = {
-    (p, thisStage.getDefault(p)) match {
+    (p, safeGetDefault(p)) match {
       case (_: ServiceParam[_], _) =>
         s"${p.name}=None,\n${p.name}Col=None"
       case (_: ComplexParam[_], _) | (_, None) =>
@@ -126,7 +179,7 @@ trait PythonWrappable extends BaseWrappable {
   }
 
   protected def pyParamDefault[T](p: Param[T]): Option[String] = {
-    (p, thisStage.getDefault(p)) match {
+    (p, safeGetDefault(p)) match {
       case (_: ServiceParam[_], _) =>
         None
       case (_: ComplexParam[_], _) | (_, None) =>
@@ -152,17 +205,28 @@ trait PythonWrappable extends BaseWrappable {
           |""".stripMargin
     // scalastyle:off line.size.limit
     p match {
-      case _: ServiceParam[_] =>
+      case sp: ServiceParam[_] =>
+        val scalarSetter = if (hasPublicStageMethod(s"set$capName", 1)) {
+          s"self._java_obj.set$capName(value)"
+        } else {
+          s"""self._java_obj.setScalarParam("${sp.name}", value)"""
+        }
+        val vectorSetter = if (hasPublicStageMethod(s"set${capName}Col", 1)) {
+          s"self._java_obj.set${capName}Col(value)"
+        } else {
+          s"""self._java_obj.setVectorParam("${sp.name}", value)"""
+        }
         s"""|def set$capName(self, value):
             |${indent(docString, 1)}
-            |    if isinstance(value, list):
-            |        value = SparkContext._active_spark_context._jvm.com.microsoft.azure.synapse.ml.param.ServiceParam.toSeq(value)
-            |    self._java_obj = self._java_obj.set$capName(value)
+            |    value = self._service_param_value_to_java(value)
+            |    self._java_obj = $scalarSetter
+            |    self._paramMap.pop(self.${sp.name}, None)
             |    return self
             |
             |def set${capName}Col(self, value):
             |${indent(docString, 1)}
-            |    self._java_obj = self._java_obj.set${capName}Col(value)
+            |    self._java_obj = $vectorSetter
+            |    self._paramMap.pop(self.${sp.name}, None)
             |    return self
             |""".stripMargin
       case _ =>
@@ -240,11 +304,25 @@ trait PythonWrappable extends BaseWrappable {
             |${indent(docString, 1)}
             |    return JavaParams._from_java(self._java_obj.get$capName())
             |""".stripMargin
-      case _: ServiceParam[_] =>
+      case sp: ServiceParam[_] =>
+        val scalarGetter = if (hasPublicStageMethod(s"get$capName", 0)) {
+          s"self._java_obj.get$capName()"
+        } else {
+          s"""self._java_obj.getScalarParam("${sp.name}")"""
+        }
+        val vectorGetter = if (hasPublicStageMethod(s"get${capName}Col", 0)) {
+          s"self._java_obj.get${capName}Col()"
+        } else {
+          s"""self._java_obj.getVectorParam("${sp.name}")"""
+        }
         s"""|
             |def get$capName(self):
             |${indent(docString, 1)}
-            |    return self._java_obj.get$capName()
+            |    return self._service_param_scalar_to_python("${sp.name}", $scalarGetter)
+            |
+            |def get${capName}Col(self):
+            |${indent(docString, 1)}
+            |    return $vectorGetter
             |""".stripMargin
       case _ =>
         s"""|
@@ -257,6 +335,174 @@ trait PythonWrappable extends BaseWrappable {
 
   protected def pyParamsGetters: String =
     thisStage.params.map(pyParamGetter).mkString("\n")
+
+  private def pyStubOptionalType(pyiType: String): String = {
+    if (pyiType == "Any") "Any" else s"Optional[$pyiType]"
+  }
+
+  private def pyStubParamArgs(p: Param[_]): Seq[String] = {
+    val pyiType = pyParamInputType(p).getOrElse(getPythonTypeInfo(p).pyiType)
+    (p, safeGetDefault(p)) match {
+      case (_: ServiceParam[_], _) =>
+        Seq(
+          s"${p.name}: ${pyStubOptionalType(pyiType)} = ...",
+          s"${p.name}Col: Optional[str] = ..."
+        )
+      case (_: ComplexParam[_], _) | (_, None) =>
+        Seq(s"${p.name}: ${pyStubOptionalType(pyiType)} = ...")
+      case _ =>
+        Seq(s"${p.name}: $pyiType = ...")
+    }
+  }
+
+  private def pyStubParamsArgs: Seq[String] =
+    thisStage.params.flatMap(pyStubParamArgs)
+
+  private def pyStubKeywordOnlyMethod(
+      methodName: String,
+      args: Seq[String],
+      returnType: String,
+      fluent: Boolean = false): String = {
+    val selfArgument = if (fluent) "self: _T" else "self"
+    if (args.isEmpty) {
+      s"def $methodName($selfArgument) -> $returnType: ..."
+    } else {
+      s"""|def $methodName(
+          |    $selfArgument,
+          |    *,
+          |${indent(args.mkString(",\n"), 1)}
+          |) -> $returnType: ...""".stripMargin
+    }
+  }
+
+  private def pyStubInitFunc: String =
+    pyStubKeywordOnlyMethod(
+      "__init__",
+      Seq("java_obj: Any = ...") ++ pyStubParamsArgs,
+      "None"
+    )
+
+  private def pyStubSetParamsFunc: String =
+    pyStubKeywordOnlyMethod("setParams", pyStubParamsArgs, "_T", fluent = true)
+
+  private def pyStubParamDefinition(p: Param[_]): String =
+    s"${p.name}: Param"
+
+  private def pyStubParamSetter(p: Param[_]): String = {
+    val capName = p.name.capitalize
+    val pyiType = pyParamInputType(p).getOrElse(getPythonTypeInfo(p).pyiType)
+    p match {
+      case _: ServiceParam[_] =>
+        s"""|def set$capName(self: _T, value: $pyiType) -> _T: ...
+            |def set${capName}Col(self: _T, value: str) -> _T: ...""".stripMargin
+      case _ =>
+        s"def set$capName(self: _T, value: $pyiType) -> _T: ..."
+    }
+  }
+
+  private def pyStubParamGetter(p: Param[_]): String = {
+    val capName = p.name.capitalize
+    p match {
+      case _: ServiceParam[_] =>
+        s"""|def get$capName(self) -> ${getPythonTypeInfo(p).pyiType}: ...
+            |def get${capName}Col(self) -> str: ...""".stripMargin
+      case _ =>
+        s"def get$capName(self) -> ${getPythonTypeInfo(p).pyiType}: ..."
+    }
+  }
+
+  private def pyStubAdditionalArgument(
+      argument: String,
+      fluent: Boolean,
+      inferredType: Option[String]): String = {
+    val trimmed = argument.trim
+    if (trimmed == "self" && fluent) {
+      "self: _T"
+    } else if (Set("self", "cls", "*", "/").contains(trimmed)) {
+      trimmed
+    } else {
+      val argumentParts = PythonMethodExtractor.splitArgumentDefault(trimmed)
+      val hasDefault = argumentParts.length > 1
+      val withoutDefault = argumentParts.head
+      val typedArgument = if (withoutDefault.contains(":")) {
+        withoutDefault.split(":", 2).map(_.trim).mkString(": ")
+      } else {
+        val argumentType = inferredType.getOrElse("Any")
+        val optionalType =
+          if (argumentParts.lift(1).contains("None") && argumentType != "Any") {
+            s"Optional[$argumentType]"
+          } else {
+            argumentType
+          }
+        s"$withoutDefault: $optionalType"
+      }
+      if (hasDefault) s"$typedArgument = ..." else typedArgument
+    }
+  }
+
+  private def pyStubAdditionalArgumentTypes(methodName: String, argumentCount: Int): Seq[String] = {
+    thisStage.getClass.getMethods
+      .filter(method => method.getName == methodName && method.getParameterCount == argumentCount)
+      .sortBy(_.toGenericString)
+      .headOption
+      .map(_.getGenericParameterTypes.toSeq.map(DefaultParamInfo.pythonMethodArgumentType))
+      .getOrElse(Seq.fill(argumentCount)("Any"))
+  }
+
+  private def isFluentStubMethod(methodName: String): Boolean =
+    methodName.startsWith("set") || methodName == "copy"
+
+  private def pyStubAdditionalReturnType(
+      methodName: String,
+      returnType: String,
+      fluent: Boolean): String = {
+    Option(returnType).map(_.trim).filter(_.nonEmpty).getOrElse {
+      if (fluent) "_T"
+      else if (methodName == "clear") "None"
+      else "Any"
+    }
+  }
+
+  private def pyStubAdditionalMethod(method: Method): Option[String] = method match {
+    case Method(_, MethodPattern(methodName, args, returnType), decorators, _) if !methodName.startsWith("_") =>
+      PythonMethodExtractor.splitArguments(args).map { methodArgs =>
+        val fluent = isFluentStubMethod(methodName)
+        val valueArgCount = methodArgs.count(arg => !Set("self", "cls", "*", "/").contains(arg.trim))
+        val inferredTypes = pyStubAdditionalArgumentTypes(methodName, valueArgCount).iterator
+        val typedArgs = methodArgs.map { argument =>
+          val inferredType =
+            if (Set("self", "cls", "*", "/").contains(argument.trim)) None
+            else Some(inferredTypes.next())
+          pyStubAdditionalArgument(argument, fluent, inferredType)
+        }.mkString(", ")
+        val typedReturn = pyStubAdditionalReturnType(methodName, returnType, fluent)
+        (decorators :+ s"def $methodName($typedArgs) -> $typedReturn: ...").mkString("\n")
+      }
+    case _ =>
+      None
+  }
+
+  private def pyStubAdditionalMethods: String = {
+    val declarations = PythonMethodExtractor.effectiveMethods(pyAdditionalMethods).map { method =>
+      PythonMethodExtractor.pythonIdentifier(method.name) -> pyStubAdditionalMethod(method)
+    }
+    val alternatives = declarations.groupBy(_._1)
+    declarations.map(_._1).distinct.flatMap { name =>
+      val rendered = alternatives(name).map(_._2)
+      if (rendered.map(_.map(PythonMethodExtractor.declarationTokens)).distinct.size == 1) rendered.head else None
+    }.mkString("\n")
+  }
+
+  private def pyStubExtraEstimatorMethods: String = {
+    thisStage match {
+      case _: Estimator[_] =>
+        val modelName = companionModelClassName.split(".".toCharArray).last
+        s"""|def _create_model(self, java_model: Any) -> $modelName: ...
+            |def _fit(self, dataset: DataFrame) -> $modelName: ...""".stripMargin
+      case _ =>
+        ""
+    }
+  }
 
   def pyInitFunc(): String = {
     s"""
@@ -278,15 +524,34 @@ trait PythonWrappable extends BaseWrappable {
        |        kwargs = self.__init__._input_kwargs
        |
        |    if java_obj is None:
-       |        for k,v in kwargs.items():
-       |            if v is not None:
-       |                getattr(self, "set" + k[0].upper() + k[1:])(v)
+       |        self._set_params_via_setters(kwargs, skip_none=True)
        |""".stripMargin
 
   }
 
+  protected def pySetParamsFunc: String = {
+    s"""|@keyword_only
+        |def setParams(
+        |    self,
+        |${indent(pyParamsArgs, 1)}
+        |    ):
+        |    "\""
+        |    Set the (keyword only) parameters
+        |    "\""
+        |    if hasattr(self, "_input_kwargs"):
+        |        kwargs = self._input_kwargs
+        |    else:
+        |        kwargs = self.__init__._input_kwargs
+        |    return self._set_params_via_setters(kwargs)
+        |""".stripMargin
+  }
+
   //scalastyle:off method.length
   protected def pythonClass(): String = {
+    validateServiceParamAliases()
+    val serviceParamNames = thisStage.params.collect {
+      case p: ServiceParam[_] => "\"" + escape(p.name) + "\""
+    }.mkString(", ")
     s"""|$copyrightLines
         |
         |import sys
@@ -312,23 +577,13 @@ trait PythonWrappable extends BaseWrappable {
         |class $pyClassName(${pyInheritedClasses.mkString(", ")}):
         |${indent(pyClassDoc, 1)}
         |
+        |    _service_param_names = frozenset([$serviceParamNames])
+        |
         |${indent(pyParamsDefinitions, 1)}
         |
         |${indent(pyInitFunc(), 1)}
         |
-        |    @keyword_only
-        |    def setParams(
-        |        self,
-        |${indent(pyParamsArgs, 2)}
-        |        ):
-        |        "\""
-        |        Set the (keyword only) parameters
-        |        "\""
-        |        if hasattr(self, \"_input_kwargs\"):
-        |            kwargs = self._input_kwargs
-        |        else:
-        |            kwargs = self.__init__._input_kwargs
-        |        return self._set(**kwargs)
+        |${indent(pySetParamsFunc, 1)}
         |
         |    @classmethod
         |    def read(cls):
@@ -357,6 +612,55 @@ trait PythonWrappable extends BaseWrappable {
   }
   //scalastyle:on method.length
 
+  private def pythonStubClass(): String = {
+    validateServiceParamAliases()
+    val paramDefinitions = thisStage.params.map(pyStubParamDefinition).mkString("\n")
+    val paramSetters = thisStage.params.map(pyStubParamSetter).mkString("\n")
+    val paramGetters = thisStage.params.map(pyStubParamGetter).mkString("\n")
+    s"""|$copyrightLines
+        |
+        |from typing import Any, Dict, List, Optional, TypeVar, Union
+        |
+        |from pyspark.ml.evaluation import JavaEvaluator
+        |from pyspark.ml.param import Param, ParamMap
+        |$pySparkParamMixinImports
+        |from pyspark.ml.util import JavaMLReadable, JavaMLWritable
+        |from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaTransformer
+        |from pyspark.sql import DataFrame
+        |from pyspark.sql.types import DataType
+        |from synapse.ml.core.serialize.java_params_patch import ComplexParamsMixin
+        |$pyExtraEstimatorImports
+        |
+        |_T = TypeVar("_T", bound="$pyClassName")
+        |
+        |class $pyClassName(${pyInheritedClasses.mkString(", ")}):
+        |${indent(pyClassDoc, 1)}
+        |
+        |${indent(paramDefinitions, 1)}
+        |
+        |${indent(pyStubInitFunc, 1)}
+        |
+        |${indent(pyStubSetParamsFunc, 1)}
+        |
+        |    @classmethod
+        |    def read(cls) -> Any: ...
+        |
+        |    @staticmethod
+        |    def getJavaPackage() -> str: ...
+        |
+        |    @staticmethod
+        |    def _from_java(java_stage: Any) -> $pyClassName: ...
+        |
+        |${indent(paramSetters, 1)}
+        |
+        |${indent(paramGetters, 1)}
+        |
+        |${indent(pyStubExtraEstimatorMethods, 1)}
+        |
+        |${indent(pyStubAdditionalMethods, 1)}
+        |""".stripMargin
+  }
+
   def makePyFile(conf: CodegenConfig): Unit = {
     val importPath = thisStage.getClass.getName.split(".".toCharArray).dropRight(1)
     val srcFolders = importPath.mkString(".")
@@ -366,6 +670,9 @@ trait PythonWrappable extends BaseWrappable {
     Files.write(
       FileUtilities.join(srcDir, pyClassName + ".py").toPath,
       pythonClass().getBytes(StandardCharsets.UTF_8))
+    Files.write(
+      FileUtilities.join(srcDir, pyClassName + ".pyi").toPath,
+      pythonStubClass().getBytes(StandardCharsets.UTF_8))
   }
 
 }

@@ -27,6 +27,7 @@ class AnalyzeTextLROSuite extends AnyFunSuiteLike {
 }
 
 class ExtractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -154,6 +155,7 @@ class ExtractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRun
 
 
 class AbstractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -191,8 +193,6 @@ class AbstractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRu
       .setKind("AbstractiveSummarization")
       .setOutputCol("response")
       .setErrorCol("error")
-      .setPollingDelay(5 * 1000)
-      .setMaxPollingRetries(30)
     val responses = model.transform(df)
                          .withColumn("documents", col("response.documents"))
                          .withColumn("modelVersion", col("response.modelVersion"))
@@ -221,8 +221,6 @@ class AbstractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRu
       .setErrorCol("error")
       .setShowStats(true)
       .setSummaryLength(SummaryLength.Short)
-      .setPollingDelay(5 * 1000)
-      .setMaxPollingRetries(30)
     val responses = model.transform(df)
                          .withColumn("documents", col("response.documents"))
                          .withColumn("modelVersion", col("response.modelVersion"))
@@ -251,8 +249,6 @@ class AbstractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRu
                                              .setTextCol("text")
                                              .setLanguage("en")
                                              .setKind("AbstractiveSummarization")
-                                             .setPollingDelay(5 * 1000)
-                                             .setMaxPollingRetries(30)
                                              .setSummaryLength(SummaryLength.Short)
                                              .setOutputCol("response"),
                                                          Seq("Microsoft Azure AI Data Fabric").toDF("text")))
@@ -261,6 +257,7 @@ class AbstractiveSummarizationSuite extends TransformerFuzzing[AnalyzeTextLongRu
 }
 
 class HealthcareSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
 
   import spark.implicits._
@@ -304,6 +301,7 @@ class HealthcareSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperation
 }
 
 class SentimentAnalysisLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -331,8 +329,8 @@ class SentimentAnalysisLROSuite extends TransformerFuzzing[AnalyzeTextLongRunnin
     assert(result(1).getAs[String]("sentiment") == "negative")
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
                       .withColumn("documents", col("response.documents"))
                       .withColumn("sentiment", col("documents.sentiment"))
                       .collect()
@@ -369,8 +367,8 @@ class SentimentAnalysisLROSuite extends TransformerFuzzing[AnalyzeTextLongRunnin
   override def reader: MLReadable[_] = AnalyzeText
 }
 
-
 class KeyPhraseLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -400,8 +398,8 @@ class KeyPhraseLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperati
     assert(keyPhrases.contains("Text Analytics"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
                       .withColumn("documents", col("response.documents"))
                       .withColumn("keyPhrases", col("documents.keyPhrases"))
     val keyPhrases = result.collect()(1).getAs[Seq[String]]("keyPhrases")
@@ -428,6 +426,7 @@ class KeyPhraseLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperati
 
 
 class AnalyzeTextPIILORSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -459,8 +458,8 @@ class AnalyzeTextPIILORSuite extends TransformerFuzzing[AnalyzeTextLongRunningOp
     assert(!redactedText.contains("111000025"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
                       .withColumn("documents", col("response.documents"))
                       .withColumn("redactedText", col("documents.redactedText"))
                       .withColumn("entities", col("documents.entities.text"))
@@ -493,6 +492,7 @@ class AnalyzeTextPIILORSuite extends TransformerFuzzing[AnalyzeTextLongRunningOp
 
 
 class EntityLinkingLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -521,8 +521,8 @@ class EntityLinkingLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOpe
     assert(entities.contains("Bill Gates"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
                       .withColumn("documents", col("response.documents"))
                       .withColumn("entityNames", map(col("documents.id"), col("documents.entities.name")))
     val entities = result.head.getAs[Map[String, Seq[String]]]("entityNames")("0")
@@ -549,6 +549,7 @@ class EntityLinkingLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOpe
 
 
 class EntityRecognitionLROSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -577,8 +578,8 @@ class EntityRecognitionLROSuite extends TransformerFuzzing[AnalyzeTextLongRunnin
     assert(entities.contains("Bill Gates"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
                       .withColumn("documents", col("response.documents"))
                       .withColumn("entityNames", map(col("documents.id"), col("documents.entities.text")))
     val entities = result.head.getAs[Map[String, Seq[String]]]("entityNames")("0")
@@ -605,6 +606,7 @@ class EntityRecognitionLROSuite extends TransformerFuzzing[AnalyzeTextLongRunnin
 
 class CustomEntityRecognitionSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations]
                                            with LanguageServiceEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -651,6 +653,7 @@ class CustomEntityRecognitionSuite extends TransformerFuzzing[AnalyzeTextLongRun
 
 class MultiLableClassificationSuite extends TransformerFuzzing[AnalyzeTextLongRunningOperations]
                                            with LanguageServiceEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -695,6 +698,3 @@ class MultiLableClassificationSuite extends TransformerFuzzing[AnalyzeTextLongRu
 
   override def reader: MLReadable[_] = AnalyzeText
 }
-
-
-

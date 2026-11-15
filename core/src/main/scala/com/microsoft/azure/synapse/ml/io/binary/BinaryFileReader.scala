@@ -7,8 +7,9 @@ import com.microsoft.azure.synapse.ml.core.env.StreamUtilities
 import com.microsoft.azure.synapse.ml.core.schema.BinaryFileSchema
 import com.microsoft.azure.synapse.ml.core.utils.AsyncUtils
 import org.apache.commons.io.IOUtils
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.types.BinaryType
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 
@@ -16,6 +17,20 @@ import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future}
 
 object BinaryFileReader {
+
+  /** Read a single file and return its bytes content.
+    *
+    * @param path Path to the file.
+    * @param conf Hadoop configuration (optional).
+    * @return     Array of bytes content.
+    */
+  def readSingleFileBytes(path: Path, conf: Configuration = new Configuration()): Array[Byte] = {
+    val fs = path.getFileSystem(conf)
+    val bytes = StreamUtilities.using(fs.open(path)) { is =>
+      IOUtils.toByteArray(is)
+    }.get
+    bytes
+  }
 
   private def recursePath(fileSystem: FileSystem,
                           path: Path,
@@ -85,15 +100,14 @@ object BinaryFileReader {
                     timeout: Int
                    ): DataFrame = {
     val outputSchema = df.schema.add(bytesCol, BinaryType, nullable = true)
-    val encoder = RowEncoder(outputSchema)
+    val encoder = ExpressionEncoder(outputSchema)
     val hconf = ConfUtils.getHConf(df)
 
     df.mapPartitions { rows =>
       val futures = rows.map {row: Row =>
         Future {
             val path = new Path(row.getAs[String](pathCol))
-            val fs = path.getFileSystem(hconf.value)
-            val bytes = StreamUtilities.using(fs.open(path)) {is => IOUtils.toByteArray(is)}.get
+            val bytes = readSingleFileBytes(path, hconf.value)
             Row.fromSeq(row.toSeq :+ bytes)
           }(ExecutionContext.global)
       }

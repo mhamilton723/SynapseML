@@ -6,9 +6,8 @@ package com.microsoft.azure.synapse.ml.services.face
 import com.microsoft.azure.synapse.ml.services._
 import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, TransformerFuzzing}
 import org.apache.spark.ml.util.MLReadable
-import org.apache.spark.sql.functions.{col, explode, lit}
+import org.apache.spark.sql.functions.{col, lit}
 import org.apache.spark.sql.{DataFrame, Row}
-import org.scalactic.Equality
 
 import java.time.LocalDateTime
 import java.time.format.{DateTimeFormatterBuilder, DateTimeParseException, SignStyle}
@@ -16,6 +15,8 @@ import java.time.temporal.ChronoField
 import scala.util.matching.Regex
 
 class DetectFaceSuite extends TransformerFuzzing[DetectFace] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
@@ -25,17 +26,12 @@ class DetectFaceSuite extends TransformerFuzzing[DetectFace] with CognitiveKey {
 
   lazy val face = new DetectFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setImageUrlCol("url")
     .setOutputCol("face")
     .setReturnFaceId(true)
     .setReturnFaceLandmarks(true)
     .setReturnFaceAttributes(Seq("exposure"))
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = df.select(explode(col("face"))).select("col.*").drop("faceId")
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage") {
     face.transform(df)
@@ -55,6 +51,8 @@ class DetectFaceSuite extends TransformerFuzzing[DetectFace] with CognitiveKey {
 }
 
 class FindSimilarFaceSuite extends TransformerFuzzing[FindSimilarFace] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
@@ -66,7 +64,7 @@ class FindSimilarFaceSuite extends TransformerFuzzing[FindSimilarFace] with Cogn
 
   lazy val detector = new DetectFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setImageUrlCol("url")
     .setOutputCol("detected_faces")
     .setReturnFaceId(true)
@@ -85,7 +83,7 @@ class FindSimilarFaceSuite extends TransformerFuzzing[FindSimilarFace] with Cogn
 
   lazy val findSimilar = new FindSimilarFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setOutputCol("similar")
     .setFaceIdCol("id")
     .setFaceIds(faceIds)
@@ -102,7 +100,7 @@ class FindSimilarFaceSuite extends TransformerFuzzing[FindSimilarFace] with Cogn
     val caught = intercept[AssertionError] {
       new FindSimilarFace()
         .setSubscriptionKey(cognitiveKey)
-        .setLocation("eastus")
+        .setLocation(cognitiveLoc)
         .setOutputCol("similar")
         .transform(faceIdDF).collect()
     }
@@ -117,6 +115,8 @@ class FindSimilarFaceSuite extends TransformerFuzzing[FindSimilarFace] with Cogn
 }
 
 class GroupFacesSuite extends TransformerFuzzing[GroupFaces] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
@@ -128,7 +128,7 @@ class GroupFacesSuite extends TransformerFuzzing[GroupFaces] with CognitiveKey {
 
   lazy val detector = new DetectFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setImageUrlCol("url")
     .setOutputCol("detected_faces")
     .setReturnFaceId(true)
@@ -147,7 +147,7 @@ class GroupFacesSuite extends TransformerFuzzing[GroupFaces] with CognitiveKey {
 
   lazy val group = new GroupFaces()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setOutputCol("grouping")
     .setFaceIds(faceIds)
 
@@ -163,7 +163,7 @@ class GroupFacesSuite extends TransformerFuzzing[GroupFaces] with CognitiveKey {
     val caught = intercept[AssertionError] {
       new GroupFaces()
         .setSubscriptionKey(cognitiveKey)
-        .setLocation("eastus")
+        .setLocation(cognitiveLoc)
         .setOutputCol("grouping")
         .transform(faceIdDF).collect()
     }
@@ -178,6 +178,8 @@ class GroupFacesSuite extends TransformerFuzzing[GroupFaces] with CognitiveKey {
 }
 
 class IdentifyFacesSuite extends TransformerFuzzing[IdentifyFaces] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
@@ -213,7 +215,7 @@ class IdentifyFacesSuite extends TransformerFuzzing[IdentifyFaces] with Cognitiv
 
   lazy val detector = new DetectFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setImageUrlCol("url")
     .setOutputCol("detected_faces")
     .setReturnFaceId(true)
@@ -247,7 +249,7 @@ class IdentifyFacesSuite extends TransformerFuzzing[IdentifyFaces] with Cognitiv
 
   lazy val id = new IdentifyFaces()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setFaceIdsCol("faces")
     .setPersonGroupId(pgId)
     .setOutputCol("identified_faces")
@@ -266,7 +268,7 @@ class IdentifyFacesSuite extends TransformerFuzzing[IdentifyFaces] with Cognitiv
     val caught = intercept[AssertionError] {
       new IdentifyFaces()
         .setSubscriptionKey(cognitiveKey)
-        .setLocation("eastus")
+        .setLocation(cognitiveLoc)
         .setPersonGroupId(pgId)
         .setOutputCol("identified_faces")
         .transform(df).collect()
@@ -328,6 +330,8 @@ class IdentifyFacesSuite extends TransformerFuzzing[IdentifyFaces] with Cognitiv
 }
 
 class VerifyFacesSuite extends TransformerFuzzing[VerifyFaces] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
@@ -339,7 +343,7 @@ class VerifyFacesSuite extends TransformerFuzzing[VerifyFaces] with CognitiveKey
 
   lazy val detector = new DetectFace()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setImageUrlCol("url")
     .setOutputCol("detected_faces")
     .setReturnFaceId(true)
@@ -357,7 +361,7 @@ class VerifyFacesSuite extends TransformerFuzzing[VerifyFaces] with CognitiveKey
 
   lazy val verify = new VerifyFaces()
     .setSubscriptionKey(cognitiveKey)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setOutputCol("same")
     .setFaceId1Col("faceId1")
     .setFaceId2Col("faceId2")

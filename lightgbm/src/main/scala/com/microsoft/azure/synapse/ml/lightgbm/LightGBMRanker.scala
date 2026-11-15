@@ -17,10 +17,10 @@ import org.apache.spark.sql.types.StructField
 
 object LightGBMRanker extends DefaultParamsReadable[LightGBMRanker]
 
-/** Trains a LightGBMRanker model, a fast, distributed, high performance gradient boosting
+/** Trains a LightGBM Ranker model using a fast, distributed, high-performance gradient boosting
   * framework based on decision tree algorithms.
-  * For more information please see here: https://github.com/Microsoft/LightGBM.
-  * For parameter information see here: https://github.com/Microsoft/LightGBM/blob/master/docs/Parameters.rst
+  * For more information, please see here: https://github.com/lightgbm-org/LightGBM.
+  * For parameter information see here: https://github.com/lightgbm-org/LightGBM/blob/master/docs/Parameters.rst
   * @param uid The unique ID.
   */
 class LightGBMRanker(override val uid: String)
@@ -50,7 +50,7 @@ class LightGBMRanker(override val uid: String)
 
   def getTrainParams(numTasks: Int, featuresSchema: StructField, numTasksPerExec: Int): BaseTrainParams = {
     RankerTrainParams(
-      get(passThroughArgs),
+      getEffectivePassThroughArgs,
       getMaxPosition,
       getLabelGain,
       getEvalAt,
@@ -92,30 +92,27 @@ class LightGBMRanker(override val uid: String)
   override def copy(extra: ParamMap): LightGBMRanker = defaultCopy(extra)
 
   override def prepareDataframe(dataset: Dataset[_], numTasks: Int): DataFrame = {
-    if (getRepartitionByGroupingColumn) {
-      val repartitionedDataset = getOptGroupCol match {
-        case None => dataset
-        case Some(groupingCol) =>
-          val numPartitions = dataset.rdd.getNumPartitions
+    getOptGroupCol.filter(_ => getRepartitionByGroupingColumn) match {
+      case Some(groupingCol) if !getUseBarrierExecutionMode =>
+        // An explicit partition count keeps adaptive execution from coalescing the grouping shuffle,
+        // and gives NetworkManager the numTasks workers it waits for. The result already has exactly
+        // numTasks partitions, so the base class's partition fitting is skipped.
+        castColumns(dataset.repartition(numTasks, new Column(groupingCol)), getTrainingCols)
+      case Some(groupingCol) =>
+        // Barrier mode never expands the input, and waits only for the tasks the stage actually runs.
+        val numPartitions = inputPartitionCount(dataset)
+        super.prepareDataframe(
+          dataset.repartition(math.min(numPartitions, numTasks), new Column(groupingCol)), numTasks)
+      case None =>
+        super.prepareDataframe(dataset, numTasks)
+    }
+  }
 
-          // in barrier mode, will use repartition in super.prepareDataframe,
-          // this will let repartition on groupingCol fail
-          // so repartition here, then super.prepareDataframe won't repartition
-          if (getUseBarrierExecutionMode) {
-            if (numPartitions > numTasks) {
-              dataset.repartition(numTasks, new Column(groupingCol))
-            } else {
-              dataset.repartition(numPartitions, new Column(groupingCol))
-            }
-          } else {
-            // if not in barrier mode, coalesce won't break repartition by groupingCol
-            dataset.repartition(new Column(groupingCol))
-          }
-      }
-
-      super.prepareDataframe(repartitionedDataset, numTasks)
-    } else {
-      super.prepareDataframe(dataset, numTasks)
+  /** Expands by the grouping column, so every query group stays within one partition. */
+  override protected def expandPartitions(df: DataFrame, numTasks: Int): DataFrame = {
+    getOptGroupCol match {
+      case Some(groupingCol) => df.repartition(numTasks, new Column(groupingCol))
+      case None => super.expandPartitions(df, numTasks)
     }
   }
 }

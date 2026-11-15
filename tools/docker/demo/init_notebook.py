@@ -27,12 +27,12 @@ syanpseMLConf = pyspark.SparkConf().setAll(
         (
             "spark.jars.packages",
             "com.microsoft.azure:synapseml_2.12:"
-            + os.getenv("SYNAPSEML_VERSION", "1.0.14")
+            + os.getenv("SYNAPSEML_VERSION", "1.1.3")
             + ",org.apache.hadoop:hadoop-azure:2.7.0,org.apache.hadoop:hadoop-common:2.7.0,com.microsoft.azure:azure-storage:2.0.0",
         ),
         (
             "spark.jars.repositories",
-            "https://mmlspark.azureedge.net/maven,https://mvnrepository.com/artifact/org.apache.hadoop/hadoop-azure,https://mvnrepository.com/artifact/com.microsoft.azure/azure-storage",
+            "https://mmlspark.blob.core.windows.net/maven",
         ),
     ],
 )

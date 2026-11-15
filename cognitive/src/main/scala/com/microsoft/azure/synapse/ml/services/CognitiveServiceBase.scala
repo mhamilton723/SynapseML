@@ -196,18 +196,38 @@ trait HasCustomAuthHeader extends HasServiceParams {
 
 trait HasCustomHeaders extends HasServiceParams {
 
-  val customHeaders = new ServiceParam[Map[String, String]](
-    this, "customHeaders", "Map of Custom Header Key-Value Tuples."
-  )
+  // Normalize at the param's own JSON boundary so every persistence path is null-safe, not only the
+  // dedicated setters. setScalarParam(customHeaders, v), setScalarParam("customHeaders", v), and
+  // Params.set(customHeaders, Left(v)) all store the raw value that ComplexParamsWritable later feeds
+  // to jsonEncode on save (and jsonDecode on load); a null map, null header name, or null header value
+  // would otherwise NPE / trip Spray JSON's require(x ne null) right here. The explicit
+  // ServiceParam[Map[String, String]] type annotation keeps the public field/getter JVM descriptor
+  // unchanged despite the anonymous subclass. Setters and build() reapply the same normalization as
+  // defense in depth. Normalization is silent (drops null entries) rather than throwing, so validation
+  // errors never render header values.
+  val customHeaders: ServiceParam[Map[String, String]] =
+    new ServiceParam[Map[String, String]](
+      this, "customHeaders", "Map of Custom Header Key-Value Tuples.") {
+      override def jsonEncode(value: Either[Map[String, String], String]): String =
+        super.jsonEncode(value.left.map(m => ServiceAuthHeaders.sanitizeHeaderMap(m)))
+
+      override def jsonDecode(json: String): Either[Map[String, String], String] =
+        super.jsonDecode(json).left.map(m => ServiceAuthHeaders.sanitizeHeaderMap(m))
+    }
 
   def setCustomHeaders(v: Map[String, String]): this.type = {
-    setScalarParam(customHeaders, v)
+    // Normalize before storing so a null map, null header name, or null header value can never reach
+    // setScalarParam and later NPE ComplexParamsWritable/Spray JSON persistence: a null map becomes
+    // empty and null-named or null-valued entries are dropped. build() reapplies this at the shared
+    // boundary as defense in depth. Public signature and legitimate headers are unchanged.
+    setScalarParam(customHeaders, ServiceAuthHeaders.sanitizeHeaderMap(v))
   }
 
-  // For Pyspark compatability accept Java HashMap as input to parameter
-  // py4J only natively supports conversions from Python Dict to Java HashMap
+  // For Pyspark compatibility accept Java HashMap as input to parameter
+  // py4J only natively supports conversions from Python Dict to Java HashMap. A null HashMap is
+  // handled here (never dereferenced) and null keys/values are dropped by the Scala overload above.
   def setCustomHeaders(v: java.util.HashMap[String, String]): this.type = {
-    setCustomHeaders(v.asScala.toMap)
+    setCustomHeaders(Option(v).map(_.asScala.toMap).getOrElse(Map.empty[String, String]))
   }
 }
 
@@ -221,7 +241,7 @@ trait HasTelemHeaders extends HasServiceParams {
     setScalarParam(telemHeaders, v)
   }
 
-  // For Pyspark compatability accept Java HashMap as input to parameter
+  // For Pyspark compatibility accept Java HashMap as input to parameter
   // py4J only natively supports conversions from Python Dict to Java HashMap
   private[ml] def setTelemHeaders(v: java.util.HashMap[String, String]): this.type = {
     setTelemHeaders(v.asScala.toMap)
@@ -308,6 +328,122 @@ object URLEncodingUtils {
   }
 }
 
+private[ml] object ServiceAuthHeaders {
+  private[ml] case class Resolution(headers: Map[String, String],
+                                    usesFabricFallback: Boolean,
+                                    usesSubscriptionKey: Boolean)
+
+  private[ml] def nonBlank(value: String): Boolean = value != null && value.trim.nonEmpty
+
+  // Normalize a header map from any caller (a writer-supplied java.util.HashMap included) into a
+  // null-safe Scala map that is safe both to store as a Spark param (ComplexParamsWritable/Spray
+  // JSON reject null keys and values, NPE-ing persistence) and to emit as HTTP headers: a null map
+  // collapses to empty, and any entry with a null name or null value is dropped. Non-null values are
+  // preserved verbatim; callers decide how to treat blank or auth-named entries. Setters normalize
+  // with this before setScalarParam, and build() reapplies it at the shared boundary as defense in
+  // depth.
+  private[ml] def sanitizeHeaderMap(headers: Map[String, String]): Map[String, String] =
+    Option(headers).getOrElse(Map.empty[String, String])
+      .filter { case (name, value) => name != null && value != null }
+
+  // Option overload for the shared boundary: a null outer Option, None, Some(null), or a null
+  // underlying map all collapse to empty before the same null-key/null-value normalization.
+  private def sanitizeHeaderMap(headers: Option[Map[String, String]]): Map[String, String] =
+    sanitizeHeaderMap(Option(headers).flatten.orNull)
+
+  // Deterministically select a non-blank credential embedded in customHeaders for one canonical
+  // auth header name, canonicalizing its casing. Blank values are ignored and mixed-case duplicates
+  // resolve by sorted header name, so an empty entry can never suppress a valid credential.
+  private def embeddedCredential(customHeaders: Map[String, String],
+                                 canonicalName: String): Option[(String, String)] =
+    customHeaders.toSeq
+      .collect {
+        case (name, value) if name.equalsIgnoreCase(canonicalName) && nonBlank(value) => name -> value
+      }
+      .sortBy(_._1)
+      .headOption
+      .map { case (_, value) => canonicalName -> value }
+
+  def resolve(subscriptionKey: Option[String],
+              subscriptionKeyHeaderName: String,
+              aadHeaderName: String,
+              aadToken: Option[String],
+              customAuthHeader: Option[String],
+              customHeaders: Option[Map[String, String]],
+              fabricFallbackAuthHeader: => Option[String],
+              telemHeaders: Option[Map[String, String]],
+              contentType: Option[String]): Resolution = {
+    val providedCustomHeaders = sanitizeHeaderMap(customHeaders)
+
+    // Header names that carry credentials in this context, compared case-insensitively.
+    def isAuthHeaderName(name: String): Boolean =
+      name.equalsIgnoreCase(subscriptionKeyHeaderName) || name.equalsIgnoreCase(aadHeaderName)
+
+    // Select one non-blank credential and retain its source even when the auth header names coincide.
+    // The by-name Fabric fallback is evaluated only when no explicit or embedded credential exists.
+    val explicitAuth: Option[((String, String), Boolean)] = subscriptionKey.filter(nonBlank)
+      .map(value => (subscriptionKeyHeaderName -> value) -> true)
+      .orElse(aadToken.filter(nonBlank).map(value => (aadHeaderName -> ("Bearer " + value)) -> false))
+      .orElse(customAuthHeader.filter(nonBlank).map(value => (aadHeaderName -> value) -> false))
+      .orElse(embeddedCredential(providedCustomHeaders, subscriptionKeyHeaderName).map(_ -> true))
+      .orElse(embeddedCredential(providedCustomHeaders, aadHeaderName).map(_ -> false))
+    val explicitAuthHeader = explicitAuth.map(_._1)
+    val fabricAuthHeader = if (explicitAuthHeader.isDefined) {
+      None
+    } else {
+      fabricFallbackAuthHeader.filter(nonBlank).map(value => aadHeaderName -> value)
+    }
+    val authHeader = explicitAuthHeader.orElse(fabricAuthHeader)
+
+    // Generic headers never carry auth: strip api-key/Authorization entries (any casing) so they
+    // can neither override the resolved credential nor duplicate it under a different case.
+    val headers = mutable.Map.empty[String, String]
+    providedCustomHeaders.foreach { case (headerName, headerValue) =>
+      if (!isAuthHeaderName(headerName)) {
+        headers += (headerName -> headerValue)
+      }
+    }
+    authHeader.foreach { case (headerName, headerValue) =>
+      headers += (headerName -> headerValue)
+    }
+    // Telemetry/generic headers never carry auth: sanitize the map and strip any
+    // api-key/Authorization entry (any casing) so telemetry can neither override the one resolved
+    // credential nor duplicate it under a different case. Non-auth telemetry headers are preserved.
+    sanitizeHeaderMap(telemHeaders).foreach { case (headerName, headerValue) =>
+      if (!isAuthHeaderName(headerName)) {
+        headers += (headerName -> headerValue)
+      }
+    }
+    contentType.filterNot(StringUtils.isEmpty).foreach(value => headers += ("Content-Type" -> value))
+
+    Resolution(
+      new scala.collection.immutable.TreeMap[String, String]() ++ headers,
+      usesFabricFallback = fabricAuthHeader.isDefined,
+      usesSubscriptionKey = explicitAuth.exists(_._2))
+  }
+
+  def build(subscriptionKey: Option[String],
+            subscriptionKeyHeaderName: String,
+            aadHeaderName: String,
+            aadToken: Option[String],
+            customAuthHeader: Option[String],
+            customHeaders: Option[Map[String, String]],
+            fabricFallbackAuthHeader: => Option[String],
+            telemHeaders: Option[Map[String, String]],
+            contentType: Option[String]): Map[String, String] = {
+    resolve(
+      subscriptionKey,
+      subscriptionKeyHeaderName,
+      aadHeaderName,
+      aadToken,
+      customAuthHeader,
+      customHeaders,
+      fabricFallbackAuthHeader,
+      telemHeaders,
+      contentType).headers
+  }
+}
+
 trait HasCognitiveServiceInput extends HasURL with HasSubscriptionKey with HasAADToken with HasCustomAuthHeader
   with HasCustomHeaders with HasTelemHeaders with SynapseMLLogging {
 
@@ -358,74 +494,100 @@ trait HasCognitiveServiceInput extends HasURL with HasSubscriptionKey with HasAA
 
   protected val aadHeaderName = "Authorization"
 
+  // Header ServiceParams may become sequences during automatic batching. Payload ServiceParams
+  // continue to use getValueOpt so document-aligned values such as text and language stay batched.
+  private def getHeaderStringValueOpt(row: Row, param: ServiceParam[String]): Option[String] =
+    ServiceHeaderValues.stringValue(getValueAnyOpt(row, param), param.name)
+
+  private def getHeaderMapValueOpt(
+      row: Row,
+      param: ServiceParam[Map[String, String]]): Option[Map[String, String]] =
+    ServiceHeaderValues.mapValue(getValueAnyOpt(row, param), param.name)
+
   protected def contentType: Row => String = { _ => "application/json" }
 
   protected def getCustomAuthHeader(row: Row): Option[String] = {
-    val providedCustomAuthHeader = getValueOpt(row, CustomAuthHeader)
-    if (providedCustomAuthHeader.isEmpty && PlatformDetails.runningOnFabric()) {
+    getHeaderStringValueOpt(row, CustomAuthHeader)
+  }
+
+  // The automatic Fabric fallback is eligible only when the request carries no explicit subscription
+  // key, AAD token, or custom auth header for this row, each counting only when non-blank (matching
+  // ServiceAuthHeaders.build, which discards blank values), so a blank/whitespace/null value can
+  // never mark the fallback ineligible and leave the writer or a non-Search cognitive consumer
+  // unauthenticated on Fabric. This gate intentionally does NOT parse customHeaders: precedence over
+  // a credential embedded in customHeaders is enforced by ServiceAuthHeaders.build, which evaluates
+  // the by-name fallback only after the embedded-credential step, so the fallback (and any token it
+  // fetches) is never reached when a non-blank embedded api-key/Authorization is present.
+  private[ml] def lacksExplicitAuthCredential(row: Row): Boolean =
+    !Seq(subscriptionKey, AADToken, CustomAuthHeader)
+      .exists(param => getHeaderStringValueOpt(row, param).isDefined)
+
+  // The automatic Fabric fallback is the lowest-priority credential. It is supplied by-name to
+  // ServiceAuthHeaders.build and therefore invoked only when build's precedence chain finds no
+  // higher-priority credential (subscription key, AAD token, explicit custom-auth header, or a
+  // credential embedded in customHeaders); it never overrides any of them. Because the token is
+  // fetched lazily inside that chain, a Fabric token-acquisition failure can never fail header
+  // preparation when a higher-priority credential is present.
+  protected def getFabricFallbackAuthHeader(row: Row): Option[String] = {
+    if (lacksExplicitAuthCredential(row) && PlatformDetails.runningOnFabric()) {
       logInfo("Using Default AAD Token On Fabric")
       Option(FabricClient.getCognitiveMWCTokenAuthHeader)
     } else {
-      providedCustomAuthHeader
+      None
     }
   }
 
   protected def getCustomHeaders(row: Row): Option[Map[String, String]] = {
-    getValueOpt(row, customHeaders)
+    getHeaderMapValueOpt(row, customHeaders)
   }
+
+  protected def supportsImplicitFabricAuthRetry: Boolean = false
 
   protected def addHeaders(req: HttpRequestBase,
                            row: Row,
                            addContentType: Boolean = true): Unit = {
 
-    val headers = getHeaders(row, addContentType)
-    headers.foreach { case (headerName, headerValue) => req.addHeader(headerName, headerValue) }
+    val resolution = resolveServiceAuthHeaders(row, addContentType, getFabricFallbackAuthHeader(row))
+    req.removeHeaders(HTTPRequestData.FabricAuthMarkerHeader)
+    resolution.headers.foreach { case (headerName, headerValue) =>
+      if (!HTTPRequestData.isFabricAuthMarker(headerName)) {
+        req.addHeader(headerName, headerValue)
+      }
+    }
+    if (resolution.usesFabricFallback && supportsImplicitFabricAuthRetry) {
+      req.addHeader(HTTPRequestData.FabricAuthMarkerHeader, "true")
+    }
   }
 
   // Returns a list of key-value pairs representing the headers
   protected def getHeaders(row: Row, addContentType: Boolean = true): Map[String, String] = {
-    val headers = mutable.Map.empty[String, String]
-    val subscriptionKeyOpt = getValueOpt(row, subscriptionKey)
-    val aadTokenOpt = getValueOpt(row, AADToken)
-    val contentTypeValue = contentType(row)
-    val customAuthHeaderOpt = getCustomAuthHeader(row)
-    val customHeadersOpt = getCustomHeaders(row)
-    val telemHeadersOpt =  getValueOpt(row, telemHeaders)
+    buildServiceAuthHeaders(row, addContentType, getFabricFallbackAuthHeader(row))
+  }
 
-    if (subscriptionKeyOpt.nonEmpty) {
-      headers += (subscriptionKeyHeaderName -> getValue(row, subscriptionKey))
-    } else if (aadTokenOpt.nonEmpty) {
-      aadTokenOpt.foreach { s =>
-        headers += (aadHeaderName -> ("Bearer " + s))
-        headers += ("x-ms-workload-resource-moniker" -> UUID.randomUUID().toString)
-      }
-    } else if (customAuthHeaderOpt.nonEmpty) {
-      customAuthHeaderOpt.foreach { s =>
-        headers += (aadHeaderName -> s)
-        headers += ("x-ms-workload-resource-moniker" -> UUID.randomUUID().toString)
-      }
-    }
+  // Assembles the final auth/custom/telemetry header map. The Fabric fallback is passed in by-name
+  // (rather than read here) so the shared credential-precedence resolution can be exercised in tests
+  // without a live Fabric environment, and so production's getFabricFallbackAuthHeader(row) is
+  // evaluated lazily -- only if ServiceAuthHeaders.build's precedence chain reaches it.
+  private[ml] def buildServiceAuthHeaders(row: Row,
+                                          addContentType: Boolean,
+                                          fabricFallbackAuthHeader: => Option[String]): Map[String, String] = {
+    resolveServiceAuthHeaders(row, addContentType, fabricFallbackAuthHeader).headers
+  }
 
-    if (customHeadersOpt.nonEmpty) {
-      customHeadersOpt.foreach { m =>
-        m.foreach { case (headerName, headerValue) =>
-          headers += (headerName -> headerValue)
-        }
-      }
-    }
-
-    if (telemHeadersOpt.nonEmpty) {
-      telemHeadersOpt.foreach { m =>
-        m.foreach { case (headerName, headerValue) =>
-          headers += (headerName -> headerValue)
-        }
-      }
-    }
-
-    if (addContentType && !StringUtils.isEmpty(contentTypeValue)) {
-      headers += ("Content-Type" -> contentTypeValue)
-    }
-    new scala.collection.immutable.TreeMap[String, String]() ++ headers
+  private def resolveServiceAuthHeaders(
+      row: Row,
+      addContentType: Boolean,
+      fabricFallbackAuthHeader: => Option[String]): ServiceAuthHeaders.Resolution = {
+    ServiceAuthHeaders.resolve(
+      getHeaderStringValueOpt(row, subscriptionKey),
+      subscriptionKeyHeaderName,
+      aadHeaderName,
+      getHeaderStringValueOpt(row, AADToken),
+      getCustomAuthHeader(row),
+      getCustomHeaders(row),
+      fabricFallbackAuthHeader,
+      getHeaderMapValueOpt(row, telemHeaders),
+      if (addContentType) Option(contentType(row)) else None)
   }
 
   protected def inputFunc(schema: StructType): Row => Option[HttpRequestBase] = {

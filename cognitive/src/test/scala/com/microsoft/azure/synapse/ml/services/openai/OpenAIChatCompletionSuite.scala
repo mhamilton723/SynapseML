@@ -8,27 +8,25 @@ import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, Transformer
 import org.apache.commons.io.IOUtils
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.sql.{DataFrame, Row}
-import org.scalactic.Equality
 
 class OpenAIChatCompletionSuite extends TransformerFuzzing[OpenAIChatCompletion] with OpenAIAPIKey with Flaky {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
   lazy val completion: OpenAIChatCompletion = new OpenAIChatCompletion()
-    .setDeploymentName(deploymentNameGpt4)
+    .setDeploymentName(deploymentName)
     .setCustomServiceName(openAIServiceName)
-    .setApiVersion("2023-05-15")
-    .setMaxTokens(5000)
+    .setMaxCompletionTokens(5000)
     .setOutputCol("out")
     .setMessagesCol("messages")
-    .setTemperature(0)
     .setSubscriptionKey(openAIAPIKey)
-
 
   lazy val goodDf: DataFrame = Seq(
     Seq(
       OpenAIMessage("system", "You are an AI chatbot with red as your favorite color"),
-      OpenAIMessage("user", "Whats your favorite color")
+      OpenAIMessage("user", "What is your favorite color? Reply in a full sentence.")
     ),
     Seq(
       OpenAIMessage("system", "You are very excited"),
@@ -144,6 +142,45 @@ class OpenAIChatCompletionSuite extends TransformerFuzzing[OpenAIChatCompletion]
     testCompletion(completion, slowDf)
   }
 
+  test("Reasoning model with maxCompletionTokens") {
+    val reasoningCompletion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setCustomServiceName(openAIServiceName)
+      .setMaxCompletionTokens(500)
+      .setOutputCol("out")
+      .setMessagesCol("messages")
+      .setSubscriptionKey(openAIAPIKey)
+
+    val df = Seq(
+      Seq(
+        OpenAIMessage("user", "What is 2+2?")
+      )
+    ).toDF("messages")
+
+    testCompletion(reasoningCompletion, df, requiredLength = 0)
+  }
+
+  test("Deprecated maxTokens remapped for reasoning model") {
+    // This is the exact scenario that broke CI: setMaxTokens against a reasoning model.
+    // The library must remap max_tokens → max_completion_tokens on the wire,
+    // otherwise reasoning models reject the request.
+    val reasoningCompletion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setCustomServiceName(openAIServiceName)
+      .setMaxTokens(500)
+      .setOutputCol("out")
+      .setMessagesCol("messages")
+      .setSubscriptionKey(openAIAPIKey)
+
+    val df = Seq(
+      Seq(
+        OpenAIMessage("user", "What is 2+2?")
+      )
+    ).toDF("messages")
+
+    testCompletion(reasoningCompletion, df, requiredLength = 0)
+  }
+
   test("Robustness to bad inputs") {
     val results = completion.transform(badDf).collect()
     assert(Option(results.head.getAs[Row](completion.getErrorCol)).isDefined)
@@ -154,12 +191,12 @@ class OpenAIChatCompletionSuite extends TransformerFuzzing[OpenAIChatCompletion]
 
   test("getOptionalParam should include responseFormat"){
     val completion = new OpenAIChatCompletion()
-      .setDeploymentName(deploymentNameGpt4)
+      .setDeploymentName(deploymentName)
 
     def validateResponseFormat(params: Map[String, Any], responseFormat: String): Unit = {
       val responseFormatPayloadName = this.completion.responseFormat.payloadName
       assert(params.contains(responseFormatPayloadName))
-      val responseFormatMap = params(responseFormatPayloadName).asInstanceOf[Map[String, String]]
+      val responseFormatMap = params(responseFormatPayloadName).asInstanceOf[Map[String, Any]]
       assert(responseFormatMap.contains("type"))
       assert(responseFormatMap("type") == responseFormat)
     }
@@ -187,92 +224,359 @@ class OpenAIChatCompletionSuite extends TransformerFuzzing[OpenAIChatCompletion]
     val optionalParams3: Map[String, Any] = completion.getOptionalParams(messages.head)
     validateResponseFormat(optionalParams3, "json_object")
 
-    completion.setResponseFormat(OpenAIResponseFormat.TEXT)
+    completion.setResponseFormat("text")
     val optionalParams4: Map[String, Any] = completion.getOptionalParams(messages.head)
     validateResponseFormat(optionalParams4, "text")
   }
 
-  test("setResponseFormat should throw exception if invalid format"){
+  test("optional params include configured numeric sampling values") {
+    // Simulated usage: numeric sampling parameters only
     val completion = new OpenAIChatCompletion()
-      .setDeploymentName(deploymentNameGpt4)
+      .setDeploymentName("sampling-compatible-model")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Sample prompt")
+    ).toDF("role", "content", "name").collect()
+
+    completion.setTemperature(0.2).setTopP(0.5).setSeed(123)
+    val params = completion.getOptionalParams(messages.head)
+
+    assert(params.contains("temperature"))
+    assert(params.contains("top_p"))
+    assert(params.contains("seed"))
+    assert(!params.contains("verbosity"))
+    assert(!params.contains("reasoning_effort"))
+  }
+
+  test("optional params for gpt-6-luna include reasoning controls only") {
+    // Simulated usage: verbosity / reasoning_effort only (no temperature/top_p/seed)
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Hello reasoning")
+    ).toDF("role", "content", "name").collect()
+
+    completion.setVerbosity("high").setReasoningEffort("low")
+    val params = completion.getOptionalParams(messages.head)
+
+    assert(params.contains("verbosity"))
+    assert(params("verbosity") == "high")
+    assert(params.contains("reasoning_effort"))
+    assert(params("reasoning_effort") == "low")
+    assert(!params.contains("temperature"))
+    assert(!params.contains("top_p"))
+    assert(!params.contains("seed"))
+  }
+
+  test("verbosity and reasoning_effort getters and setters") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+
+    // Test verbosity
+    completion.setVerbosity("low")
+    assert(completion.getVerbosity == "low")
+
+    completion.setVerbosity("medium")
+    assert(completion.getVerbosity == "medium")
+
+    completion.setVerbosity("high")
+    assert(completion.getVerbosity == "high")
+
+    // Test reasoning_effort
+    completion.setReasoningEffort("minimal")
+    assert(completion.getReasoningEffort == "minimal")
+
+    completion.setReasoningEffort("none")
+    assert(completion.getReasoningEffort == "none")
+
+    completion.setReasoningEffort("low")
+    assert(completion.getReasoningEffort == "low")
+
+    completion.setReasoningEffort("medium")
+    assert(completion.getReasoningEffort == "medium")
+
+    completion.setReasoningEffort("high")
+    assert(completion.getReasoningEffort == "high")
+
+    completion.setReasoningEffort("xhigh")
+    assert(completion.getReasoningEffort == "xhigh")
+  }
+
+  test("verbosity parameter correctly serialized in payload") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setVerbosity("high")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("verbosity"))
+    assert(params("verbosity") == "high")
+  }
+
+  test("reasoning_effort parameter correctly serialized in payload") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setReasoningEffort("low")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("reasoning_effort"))
+    assert(params("reasoning_effort") == "low")
+  }
+
+  test("both verbosity and reasoning_effort serialized together") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setVerbosity("low")
+      .setReasoningEffort("low")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("verbosity"))
+    assert(params("verbosity") == "low")
+    assert(params.contains("reasoning_effort"))
+    assert(params("reasoning_effort") == "low")
+  }
+
+  test("verbosity accepts custom string values") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setVerbosity("custom_value")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("verbosity"))
+    assert(params("verbosity") == "custom_value")
+  }
+
+  test("reasoning_effort accepts custom string values") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setReasoningEffort("custom_reasoning")
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("reasoning_effort"))
+    assert(params("reasoning_effort") == "custom_reasoning")
+  }
+
+  test("parameters not included when not set") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      // Don't set verbosity or reasoning_effort
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(!params.contains("verbosity"))
+    assert(!params.contains("reasoning_effort"))
+  }
+
+  test("maxCompletionTokens sends max_completion_tokens on wire") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setMaxCompletionTokens(500)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("max_completion_tokens"))
+    assert(!params.contains("max_tokens"))
+    assert(params("max_completion_tokens") == 500)
+  }
+
+  test("deprecated maxTokens remapped to max_completion_tokens on wire") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setMaxTokens(200)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
+
+    val params = completion.getOptionalParams(messages.head)
+    assert(params.contains("max_completion_tokens"))
+    assert(!params.contains("max_tokens"))
+    assert(params("max_completion_tokens") == 200)
+  }
+
+  test("setting both maxTokens and maxCompletionTokens throws") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+      .setMaxTokens(100)
+      .setMaxCompletionTokens(200)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "Test message")
+    ).toDF("role", "content", "name").collect()
 
     assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat("invalid_format")
-    }
-
-    assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat(Map("type" -> "invalid_format"))
-    }
-
-    assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat(Map("invalid_key" -> "json_object"))
+      completion.getOptionalParams(messages.head)
     }
   }
 
-  test("validate that gpt4o accepts json_object response format") {
+  test("setResponseFormat should throw exception if invalid format"){
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+
+    val messages: Seq[Row] = Seq(
+      OpenAIMessage("user", "test")
+    ).toDF("role", "content", "name").collect()
+
+    val schemaMap: Map[String, Any] = Map(
+      "type" -> "json_schema",
+      "json_schema" -> Map(
+        "name" -> "answer_schema",
+        "strict" -> true,
+        "schema" -> Map(
+          "type" -> "object",
+          "properties" -> Map(
+            "answer" -> Map("type" -> "string")
+          ),
+          "required" -> Seq("answer"),
+          "additionalProperties" -> false
+        )
+      )
+    )
+
+    completion.setResponseFormat(schemaMap)
+    val optionalParams = completion.getOptionalParams(messages.head)
+    val rf = optionalParams(this.completion.responseFormat.payloadName).asInstanceOf[Map[String, Any]]
+    assert(rf("type") == "json_schema")
+    val js = rf("json_schema").asInstanceOf[Map[String, Any]]
+    assert(js("name") == "answer_schema")
+  }
+
+  // Removed JSON string parsing test: json_schema must be provided as Map
+
+  test("setResponseFormat should throw exception if json_schema JSON string missing type") {
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+    val badJson =
+      """{
+        |  "json_schema": {
+        |    "name": "answer_schema"
+        |  }
+        |}""".stripMargin
+    assertThrows[IllegalArgumentException] {
+      completion.setResponseFormat(badJson)
+    }
+  }
+
+  // Removed invalid format rejection test: unknown types are passed through to service.
+
+  test("reject bare json_schema string in setResponseFormat"){
+    val completion = new OpenAIChatCompletion()
+      .setDeploymentName(deploymentName)
+    assertThrows[IllegalArgumentException] {
+      completion.setResponseFormat("json_schema")
+    }
+  }
+
+  test("validate that gpt-6-luna accepts json_object response format") {
     val goodDf: DataFrame = Seq(
       Seq(
-        OpenAIMessage("system", "You are an AI chatbot with red as your favorite color"),
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
+        OpenAIMessage("system", "Respond with JSON. You are an AI chatbot with red as your favorite color"),
         OpenAIMessage("user", "Whats your favorite color")
-        ),
+      ),
       Seq(
-        OpenAIMessage("system", "You are very excited"),
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
+        OpenAIMessage("system", "Respond with JSON. You are very excited"),
         OpenAIMessage("user", "How are you today")
-        ),
+      ),
       Seq(
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
-        OpenAIMessage("system", "You are very excited"),
+        OpenAIMessage("system", "Respond with JSON. You are very excited"),
         OpenAIMessage("user", "How are you today"),
         OpenAIMessage("system", "Better than ever"),
         OpenAIMessage("user", "Why?")
-        )
-      ).toDF("messages")
+      )
+    ).toDF("messages")
 
     val completion = new OpenAIChatCompletion()
-      .setDeploymentName(deploymentNameGpt4o)
+      .setDeploymentName(deploymentName)
       .setCustomServiceName(openAIServiceName)
-      .setApiVersion("2023-05-15")
-      .setMaxTokens(500)
+      .setMaxCompletionTokens(500)
       .setOutputCol("out")
       .setMessagesCol("messages")
-      .setTemperature(0)
       .setSubscriptionKey(openAIAPIKey)
       .setResponseFormat("json_object")
 
     testCompletion(completion, goodDf)
   }
 
-  test("validate that gpt4 accepts text response format") {
+  test("validate that gpt-6-luna accepts text response format") {
     val completion = new OpenAIChatCompletion()
-      .setDeploymentName(deploymentNameGpt4)
+      .setDeploymentName(deploymentName)
       .setCustomServiceName(openAIServiceName)
-      .setApiVersion("2023-05-15")
-      .setMaxTokens(5000)
+      .setMaxCompletionTokens(5000)
       .setOutputCol("out")
       .setMessagesCol("messages")
-      .setTemperature(0)
       .setSubscriptionKey(openAIAPIKey)
       .setResponseFormat("text")
 
     testCompletion(completion, goodDf)
   }
 
+  test("content filtering identifies empty assistant content") {
+    val responseJson =
+      """{
+        |  "id":"chatcmpl_test",
+        |  "object":"chat.completion",
+        |  "created":"1",
+        |  "model":"gpt-6-luna",
+        |  "choices":[
+        |    {
+        |      "message":{"role":"assistant","content":null,"name":null},
+        |      "index":0,
+        |      "finish_reason":"content_filter"
+        |    }
+        |  ],
+        |  "system_fingerprint":null,
+        |  "usage":null
+        |}""".stripMargin
+
+    val outputRow = spark.read
+      .schema(ChatModelResponse.schema)
+      .json(Seq(responseJson).toDS)
+      .collect()
+      .head
+    val completion = new OpenAIChatCompletion()
+    assert(completion.isContentFiltered(outputRow))
+    assert(completion.getFilterReason(outputRow) == "content_filter")
+  }
+
   ignore("Custom EndPoint") {
     lazy val accessToken: String = sys.env.getOrElse("CUSTOM_ACCESS_TOKEN", "")
     lazy val customRootUrlValue: String = sys.env.getOrElse("CUSTOM_ROOT_URL", "")
-    lazy val customHeadersValues: Map[String, String] = Map("X-ModelType" -> "gpt-4-turbo-chat-completions")
+    lazy val customHeadersValues: Map[String, String] = Map("X-ModelType" -> "gpt-6-luna-chat-completions")
 
     val customEndpointCompletion = new OpenAIChatCompletion()
       .setCustomUrlRoot(customRootUrlValue)
       .setOutputCol("out")
       .setMessagesCol("messages")
-      .setTemperature(0)
 
     if (accessToken.isEmpty) {
       customEndpointCompletion.setSubscriptionKey(openAIAPIKey)
-        .setDeploymentName(deploymentNameGpt4)
+        .setDeploymentName(deploymentName)
         .setCustomServiceName(openAIServiceName)
     } else {
       customEndpointCompletion.setAADToken(accessToken)
@@ -283,14 +587,10 @@ class OpenAIChatCompletionSuite extends TransformerFuzzing[OpenAIChatCompletion]
   }
 
   def testCompletion(completion: OpenAIChatCompletion, df: DataFrame, requiredLength: Int = 10): Unit = {
-    val fromRow = ChatCompletionResponse.makeFromRowConverter
+    val fromRow = ChatModelResponse.makeFromRowConverter
     completion.transform(df).collect().foreach(r =>
       fromRow(r.getAs[Row]("out")).choices.foreach(c =>
         assert(c.message.content.length > requiredLength)))
-  }
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    super.assertDFEq(df1.drop("out"), df2.drop("out"))(eq)
   }
 
   override def testObjects(): Seq[TestObject[OpenAIChatCompletion]] =

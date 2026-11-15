@@ -1,27 +1,23 @@
-const math = require('remark-math')
-const katex = require('rehype-katex')
 const path = require('path');
-let version = "1.0.14";
+const preprocessLegacyMarkdown = require('./legacyMarkdownPreprocessor');
+let version = "1.1.3";
 
-module.exports = {
+module.exports = async function createConfigAsync() {
+    return {
     title: 'SynapseML',
     tagline: 'Simple and Distributed Machine Learning',
     url: 'https://microsoft.github.io',
     baseUrl: '/SynapseML/',
+    markdown: {
+        preprocessor: preprocessLegacyMarkdown,
+    },
     favicon: 'img/favicon.ico',
     organizationName: 'microsoft',
     projectName: 'SynapseML',
     trailingSlash: true,
     customFields: {
-        version: "1.0.14",
+        version: "1.1.3",
     },
-    stylesheets: [
-        {
-            href: "https://cdn.jsdelivr.net/npm/katex@0.13.11/dist/katex.min.css",
-            integrity: "sha384-Um5gpz1odJg5Z4HAmzPtgZKdTBHZdw8S29IecapCSB31ligYPhHQZMIlWLYQGVoc",
-            crossorigin: "anonymous",
-        },
-    ],
     themeConfig: {
         prism: {
             theme: require('./src/plugins/prism_themes/github'),
@@ -92,7 +88,7 @@ module.exports = {
                         },
                         {
                             label: 'Scala API Reference',
-                            to: 'https://mmlspark.blob.core.windows.net/docs/1.0.14/scala/index.html',
+                            to: 'https://mmlspark.blob.core.windows.net/docs/1.1.3/scala/index.html',
                         },
                     ],
                 },
@@ -138,11 +134,14 @@ module.exports = {
             {
                 docs: {
                     sidebarPath: require.resolve('./sidebars.js'),
-                    remarkPlugins: [math],
-                    rehypePlugins: [katex],
+                    remarkPlugins: [(await import('remark-math')).default],
+                    rehypePlugins: [(await import('rehype-katex')).default],
                 },
                 theme: {
-                    customCss: require.resolve('./src/css/custom.css'),
+                    customCss: [
+                        require.resolve('katex/dist/katex.min.css'),
+                        require.resolve('./src/css/custom.css'),
+                    ],
                 },
                 gtag: {
                     trackingID: 'G-RWPE0183E8',
@@ -186,7 +185,7 @@ module.exports = {
                         from: '/docs/features/cognitive_services/CognitiveServices%20-%20Overview/',
                     },
                     {
-                        to: '/docs/Explore Algorithms/AI Services/Multivariate Anomaly Detection/',
+                        to: '/docs/Explore Algorithms/Anomaly Detection/Quickstart - Isolation Forests/',
                         from: '/docs/features/isolation_forest/IsolationForest%20-%20Multivariate%20Anomaly%20Detection/',
                     },
                     {
@@ -254,7 +253,7 @@ module.exports = {
                         from: '/docs/features/responsible_ai/Interpretability%20-%20Tabular%20SHAP%20explainer/',
                     },
                     {
-                        to: '/docs/Explore Algorithms/AI Services/Multivariate Anomaly Detection/',
+                        to: '/docs/Explore Algorithms/Anomaly Detection/Quickstart - Isolation Forests/',
                         from: '/docs/features/cognitive_services/CognitiveServices%20-%20Multivariate%20Anomaly%20Detection/',
                     },
                     {
@@ -402,7 +401,7 @@ module.exports = {
                         from: "/docs/0.9.5/features/responsible_ai/Interpretability%20-%20Explanation%20Dashboard/",
                     },
                     {
-                        to: "/docs/Quick Examples/estimators/estimators_cognitive/",
+                        to: "/docs/Quick Examples/transformers/transformers_cognitive/",
                         from: "/docs/documentation/estimators/estimators_cognitive/",
                     },
                     {
@@ -477,4 +476,5 @@ module.exports = {
             },
         ],
     ],
+    };
 };

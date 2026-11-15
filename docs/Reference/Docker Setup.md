@@ -30,9 +30,9 @@ You can now select one of the sample notebooks and run it, or create your own.
 ## Running a specific version
 
 In the preceding docker command, `mcr.microsoft.com/mmlspark/release` specifies the project and image name that you
-want to run.  There's another component implicit here: the _tsag_ (=
+want to run.  There's another component implicit here: the _tag_ (=
 version) that you want to use. Specifying it explicitly looks like
-`mcr.microsoft.com/mmlspark/release:1.0.14` for the `1.0.14` tag.
+`mcr.microsoft.com/mmlspark/release:1.1.3` for the `1.1.3` tag.
 
 Leaving `mcr.microsoft.com/mmlspark/release` by itself has an implicit `latest` tag, so it's
 equivalent to `mcr.microsoft.com/mmlspark/release:latest`.  The `latest` tag is identical to the
@@ -48,17 +48,17 @@ that you'll probably want to use can look as follows:
 docker run -it --rm \
            -p 127.0.0.1:80:8888 \
            -v ~/myfiles:/notebooks/myfiles \
-           mcr.microsoft.com/mmlspark/release:1.0.14
+           mcr.microsoft.com/mmlspark/release:1.1.3
 ```
 
 In this example, backslashes are for readability; you
 can enter the command as one long line if you like.  In PowerShell, the `myfiles` local
-path and line breaks looks a little different:
+path and line breaks look a little different:
 
     docker run -it --rm `
                -p 127.0.0.1:80:8888 `
                -v C:\myfiles:/notebooks/myfiles `
-               mcr.microsoft.com/mmlspark/release:1.0.14
+               mcr.microsoft.com/mmlspark/release:1.1.3
 
 Let's break this command and go over the meaning of each part:
 
@@ -76,7 +76,7 @@ Let's break this command and go over the meaning of each part:
     filesystem data for files that were created or modified.  If you ran the above
     quickstart command, you can see the container that is left behind with `docker
     container list -a`.  You can reclaim such containers with `docker container rm
-    <id/>`, or reclaim all containers from stopped run with `docker container
+    <id/>`, or reclaim all containers from stopped runs with `docker container
     prune`, or even more generally, reclaim all unused Docker resources with
     `docker system prune`.
 
@@ -100,12 +100,12 @@ Let's break this command and go over the meaning of each part:
     8888:8888` to say that we want to map port 8888 (LHS) on our actual machine to
     port 8888 (RHS) in the container.  One problem with this is that `8888` might
     be hard to remember, but a more serious problem is that your machine now
-    serves the Jupyter interface to any one on your network.
+    serves the Jupyter interface to anyone on your network.
 
     This more complete example resolves these issues: we replaced `8888:8888` with
     `80:8888` so HTTP port 80 goes to the container's running Jupyter (making just
     <http://localhost/> work); and we also added a `127.0.0.1:` prefix to make the
-    Jupyter inteface available only from your own machine rather than the whole network.
+    Jupyter interface available only from your own machine rather than the whole network.
 
     You can repeat this flag to forward additional ports similarly.  For example,
     you can expose some of the [Spark ports], for example: `-p 127.0.0.1:4040:4040`.
@@ -141,7 +141,7 @@ Let's break this command and go over the meaning of each part:
     model.write().overwrite().save('myfiles/myTrainedModel.mml')
     ```
 
--   **`mcr.microsoft.com/mmlspark/release:1.0.14`**
+-   **`mcr.microsoft.com/mmlspark/release:1.1.3`**
 
     Finally, this argument specifies an explicit version tag for the image that we want to
     run.

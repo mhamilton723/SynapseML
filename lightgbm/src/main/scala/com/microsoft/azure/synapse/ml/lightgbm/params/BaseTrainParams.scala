@@ -4,7 +4,7 @@
 package com.microsoft.azure.synapse.ml.lightgbm.params
 
 import com.microsoft.azure.synapse.ml.core.utils.{ParamGroup, ParamsStringBuilder}
-import com.microsoft.azure.synapse.ml.lightgbm.LightGBMDelegate
+import com.microsoft.azure.synapse.ml.lightgbm.{LightGBMDelegate, LightGBMUtils}
 
 /** Defines the common Booster parameters passed to the LightGBM learners.
   */
@@ -94,18 +94,22 @@ case class GeneralParams(parallelism: String,
                          featureNames: Array[String]) extends ParamGroup {
   def appendParams(sb: ParamsStringBuilder): ParamsStringBuilder =
   {
+    // Match complete pass-through names so reloaded defaults cannot shadow native aliases.
+    val nodeFraction = if (LightGBMUtils.parameterValues(sb.result(),
+      Set("feature_fraction_bynode", "colsample_bynode", "sub_feature_bynode")).isEmpty) featureFractionByNode else None
     sb.appendParamValueIfNotThere("is_pre_partition", Option("True"))
       .appendParamValueIfNotThere("boosting_type", Option(boostingType))
       .appendParamValueIfNotThere("tree_learner", Option(parallelism))
       .appendParamValueIfNotThere("top_k", topK)
       .appendParamValueIfNotThere("num_leaves", numLeaves)
       .appendParamValueIfNotThere("max_bin", maxBin)
-      .appendParamValueIfNotThere("min_data_per_bin", minDataPerBin)
+      .appendParamValueIfNotThere("min_data_in_bin", minDataPerBin)
       .appendParamValueIfNotThere("bagging_fraction", baggingFraction)
       .appendParamValueIfNotThere("pos_bagging_fraction", posBaggingFraction)
       .appendParamValueIfNotThere("neg_bagging_fraction", negBaggingFraction)
       .appendParamValueIfNotThere("bagging_freq", baggingFreq)
       .appendParamValueIfNotThere("feature_fraction", featureFraction)
+      .append(nodeFraction.map(value => s"feature_fraction_bynode=$value").getOrElse(""))
       .appendParamValueIfNotThere("max_depth", maxDepth)
       .appendParamValueIfNotThere("min_sum_hessian_in_leaf", minSumHessianInLeaf)
       .appendParamValueIfNotThere("lambda_l1", lambdaL1)
@@ -120,7 +124,6 @@ case class GeneralParams(parallelism: String,
       .appendParamValueIfNotThere("verbosity", Option(verbosity))
       .appendParamValueIfNotThere("early_stopping_round", Option(earlyStoppingRound))
       .appendParamValueIfNotThere("learning_rate", Option(learningRate))
-      .appendParamValueIfNotThere("min_data_per_bin", minDataPerBin)
       .appendParamListIfNotThere("categorical_feature", categoricalFeatures)
       .appendParamListIfNotThere("max_bin_by_feature", maxBinByFeature)
       .appendParamValueIfNotThere("top_rate", topRate)
@@ -178,7 +181,12 @@ case class DartModeParams(dropRate: Double,
   * @param samplingSetSize The size of the subset if sampling only a subset.
   * @param microBatchSize The number of elements in a streaming micro-batch.
   * @param useSingleDatasetMode Whether to create only 1 LightGBM Dataset on each worker.
-  * @param maxStreamingOMPThreads Maximum number of streaming mode OpenMP threads per Spark Task thread.
+  * @param maxStreamingOMPThreads Streaming OpenMP allocation hint per Spark task thread.
+  *                               Fixed bounds have a 16-slot floor and cover numThreads, OpenMP environment or
+  *                               affinity hints, and registered thread history, with best-effort OS/JVM fallback.
+  *                               A valid OMP_THREAD_LIMIT bounds requests above that floor only on Linux.
+  *                               One pushing thread uses native auto-sizing only for a nonpositive effective
+  *                               native thread count with OpenMP dynamic teams disabled. The hint is not a thread cap.
   */
 case class ExecutionParams(chunkSize: Int,
                            matrixType: String,

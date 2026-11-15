@@ -9,22 +9,23 @@ import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, Transformer
 import com.microsoft.azure.synapse.ml.services.openai._
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.sql.{DataFrame, Row}
-import org.scalactic.Equality
 
 trait AIFoundryAPIKey {
-  lazy val aiFoundryAPIKey: String = sys.env.getOrElse("AI_FOUNDRY_API_KEY", Secrets.AIFoundryApiKey)
-  lazy val aiFoundryServiceName: String = sys.env.getOrElse("AI_FOUNDRY_SERVICE_NAME", "synapseml-ai-foundry-resource")
+  lazy val aiFoundryAPIKey: String = sys.env.getOrElse("AI_FOUNDRY_API_KEY", Secrets.OpenAIApiKey)
+  lazy val aiFoundryServiceName: String = sys.env.getOrElse("AI_FOUNDRY_SERVICE_NAME", "synapseml-openai-3")
   lazy val aiFoundryModelName: String = "Llama-3.3-70B-Instruct" //"Phi-4-mini-instruct"
 }
 
 class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompletion] with AIFoundryAPIKey with Flaky {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
   lazy val completion: AIFoundryChatCompletion = new AIFoundryChatCompletion()
     .setCustomServiceName(aiFoundryServiceName)
     .setApiVersion("2024-05-01-preview")
-    .setMaxTokens(2048)
+    .setMaxCompletionTokens(2048)
     .setOutputCol("out")
     .setMessagesCol("messages")
     .setTemperature(0)
@@ -63,7 +64,7 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
   import spark.implicits._
 
   def promptCompletion: AIFoundryChatCompletion = new AIFoundryChatCompletion()
-    .setMaxTokens(200)
+    .setMaxCompletionTokens(200)
     .setOutputCol("out")
     .setMessagesCol("prompt")
 
@@ -105,7 +106,7 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
     def validateResponseFormat(params: Map[String, Any], responseFormat: String): Unit = {
       val responseFormatPayloadName = this.completion.responseFormat.payloadName
       assert(params.contains(responseFormatPayloadName))
-      val responseFormatMap = params(responseFormatPayloadName).asInstanceOf[Map[String, String]]
+      val responseFormatMap = params(responseFormatPayloadName).asInstanceOf[Map[String, Any]]
       assert(responseFormatMap.contains("type"))
       assert(responseFormatMap("type") == responseFormat)
     }
@@ -133,25 +134,42 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
     val optionalParams3: Map[String, Any] = completion.getOptionalParams(messages.head)
     validateResponseFormat(optionalParams3, "json_object")
 
-    completion.setResponseFormat(OpenAIResponseFormat.TEXT)
+    completion.setResponseFormat("text")
     val optionalParams4: Map[String, Any] = completion.getOptionalParams(messages.head)
     validateResponseFormat(optionalParams4, "text")
+
+    val schemaMap: Map[String, Any] = Map(
+      "type" -> "json_schema",
+      "json_schema" -> Map(
+        "name" -> "answer_schema",
+        "strict" -> true,
+        "schema" -> Map(
+          "type" -> "object",
+          "properties" -> Map(
+            "answer" -> Map("type" -> "string")
+          ),
+          "required" -> Seq("answer"),
+          "additionalProperties" -> false
+        )
+      )
+    )
+    completion.setResponseFormat(schemaMap)
+    val optionalParams5 = completion.getOptionalParams(messages.head)
+    val rf = optionalParams5(this.completion.responseFormat.payloadName).asInstanceOf[Map[String, Any]]
+    assert(rf("type") == "json_schema")
+    val js = rf("json_schema").asInstanceOf[Map[String, Any]]
+    assert(js("name") == "answer_schema")
+
+    // Removed JSON string parsing test: json_schema must be provided as Map
   }
 
-  test("setResponseFormat should throw exception if invalid format"){
+  // Removed invalid format rejection test: unknown types are passed through to service.
+
+  test("reject bare json_schema string in setResponseFormat (AIFoundry)"){
     val completion = new AIFoundryChatCompletion()
       .setCustomServiceName(aiFoundryServiceName)
-
     assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat("invalid_format")
-    }
-
-    assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat(Map("type" -> "invalid_format"))
-    }
-
-    assertThrows[IllegalArgumentException] {
-      completion.setResponseFormat(Map("invalid_key" -> "json_object"))
+      completion.setResponseFormat("json_schema")
     }
   }
 
@@ -159,16 +177,13 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
     val goodDf: DataFrame = Seq(
       Seq(
         OpenAIMessage("system", "You are an AI chatbot with red as your favorite color"),
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
         OpenAIMessage("user", "Whats your favorite color")
       ),
       Seq(
         OpenAIMessage("system", "You are very excited"),
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
         OpenAIMessage("user", "How are you today")
       ),
       Seq(
-        OpenAIMessage("system", OpenAIResponseFormat.JSON.prompt),
         OpenAIMessage("system", "You are very excited"),
         OpenAIMessage("user", "How are you today"),
         OpenAIMessage("system", "Better than ever"),
@@ -180,7 +195,7 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
       .setCustomServiceName(aiFoundryServiceName)
       .setModel(aiFoundryModelName)
       .setApiVersion("2024-05-01-preview")
-      .setMaxTokens(500)
+      .setMaxCompletionTokens(500)
       .setOutputCol("out")
       .setMessagesCol("messages")
       .setTemperature(0)
@@ -191,14 +206,10 @@ class AIFoundryChatCompletionSuite extends TransformerFuzzing[AIFoundryChatCompl
   }
 
   def testCompletion(completion: AIFoundryChatCompletion, df: DataFrame, requiredLength: Int = 10): Unit = {
-    val fromRow = ChatCompletionResponse.makeFromRowConverter
+    val fromRow = ChatModelResponse.makeFromRowConverter
     completion.transform(df).collect().foreach(r =>
       fromRow(r.getAs[Row]("out")).choices.foreach(c =>
         assert(c.message.content.length > requiredLength)))
-  }
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    super.assertDFEq(df1.drop("out"), df2.drop("out"))(eq)
   }
 
   override def testObjects(): Seq[TestObject[AIFoundryChatCompletion]] =

@@ -1,0 +1,899 @@
+"""Validation for the sbt-bootstrap CI hardening wiring in pipeline.yaml.
+
+Ensures the durable fix is actually wired in: every sbt-running job restores the
+shared bootstrap cache, the prewarm job exists, the cache keys invalidate on the
+bootstrap inputs, and the duplicated inline retry blocks were replaced by the
+shared helper. Run with: ``python -m pytest tools/ci/tests/test_pipeline_yaml.py``.
+"""
+
+import os
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BUILD_SBT = REPO_ROOT / "build.sbt"
+PIPELINE = REPO_ROOT / "pipeline.yaml"
+SBT_CACHE_TPL = REPO_ROOT / "templates" / "sbt_cache.yml"
+SBT_RETRY = REPO_ROOT / "tools" / "ci" / "sbt_retry.sh"
+SBT_VERSION = REPO_ROOT / "tools" / "ci" / "get_sbt_version.sh"
+TEST_IMPACT = REPO_ROOT / "tools" / "ci" / "e2e_impact.py"
+DATABRICKS_STEPS_TPL = REPO_ROOT / "templates" / "databricks_e2e_steps.yml"
+KEY_VAULT_TPL = REPO_ROOT / "templates" / "kv.yml"
+FABRIC_KEY_VAULT_TPL = REPO_ROOT / "templates" / "fabric_kv.yml"
+PUBLISH_TPL = REPO_ROOT / "templates" / "publish.yml"
+CLEAN_ACR_PIPELINE = REPO_ROOT / ".pipelines" / "clean-acr.yml"
+DEMO_DOCKERFILE = REPO_ROOT / "tools" / "docker" / "demo" / "Dockerfile"
+MINIMAL_DOCKERFILE = REPO_ROOT / "tools" / "docker" / "minimal" / "Dockerfile"
+
+
+def _pipeline_text():
+    return PIPELINE.read_text()
+
+
+def _jobs(node):
+    if isinstance(node, dict):
+        if "job" in node:
+            yield node
+        for value in node.values():
+            yield from _jobs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _jobs(value)
+
+
+def _secret_filter(value):
+    return set(value.replace(",", " ").split())
+
+
+def _fabric_certificate_script():
+    data = yaml.safe_load(FABRIC_KEY_VAULT_TPL.read_text())
+    certificate_task = next(
+        step
+        for step in data["steps"]
+        if step.get("displayName") == "Get Fabric Test Certificate from Key Vault"
+    )
+    return certificate_task["inputs"]["inlineScript"]
+
+
+def _run_fabric_certificate_script(
+    tmp_path, account, certificate="test-pfx", az_exit=0
+):
+    mock_az = tmp_path / "az"
+    mock_az.write_text(
+        """#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$MOCK_AZ_ARGS"
+if [ "$MOCK_AZ_EXIT" -ne 0 ]; then
+  exit "$MOCK_AZ_EXIT"
+fi
+printf '%s' "$MOCK_CERTIFICATE"
+"""
+    )
+    mock_az.chmod(0o755)
+    az_args = tmp_path / "az-args.txt"
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{tmp_path}{os.pathsep}{env['PATH']}",
+            "FABRIC_CERT_KEY_VAULT_NAME": "test-cert-vault",
+            "INTEGRATION_ACCOUNT": account,
+            "MOCK_AZ_ARGS": str(az_args),
+            "MOCK_AZ_EXIT": str(az_exit),
+            "MOCK_CERTIFICATE": certificate,
+        }
+    )
+    result = subprocess.run(
+        ["bash", "-c", _fabric_certificate_script()],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return result, az_args
+
+
+def test_pipeline_and_templates_parse():
+    assert yaml.safe_load(PIPELINE.read_text()) is not None
+    assert yaml.safe_load(CLEAN_ACR_PIPELINE.read_text()) is not None
+    for tpl in (REPO_ROOT / "templates").glob("*.yml"):
+        assert yaml.safe_load(tpl.read_text()) is not None, f"{tpl} failed to parse"
+
+
+def test_pipeline_has_no_release_branch_replay():
+    text = _pipeline_text()
+    data = yaml.safe_load(text)
+    jobs = {job["job"] for job in _jobs(data["jobs"])}
+    assert "ReleaseBranchCompat" not in jobs
+    assert "releaseCompatRequired" not in text
+    assert not (REPO_ROOT / ".pipelines" / "release-compat-prerequisites.txt").exists()
+
+
+@pytest.mark.parametrize("event", ["trigger", "pr"])
+def test_direct_spark41_validation_remains_enabled(event):
+    data = yaml.safe_load(_pipeline_text())
+    assert "spark4.1" in data[event]["branches"]["include"]
+    jobs = {job["job"] for job in _jobs(data["jobs"])}
+    assert {"BuildAndCacheSbt", "Style", "UnitTests", "PythonTests", "Release"} <= jobs
+
+
+def test_build_has_canonical_maven_central_fallback():
+    build = "\n".join(
+        line
+        for line in BUILD_SBT.read_text().splitlines()
+        if not line.lstrip().startswith("//")
+    )
+    resolver = (
+        r'"Maven Central fallback"\s+at\s+' r'"https://repo\.maven\.apache\.org/maven2"'
+    )
+    active_setting = (
+        rf"ThisBuild\s*/\s*resolvers\s*"
+        rf"(?:\+=\s*{resolver}|\+\+=\s*Seq\s*\([^)]*{resolver}[^)]*\))"
+    )
+    assert len(re.findall(active_setting, build, flags=re.DOTALL)) == 1
+
+
+def test_sbt_cache_template_exists_and_parses():
+    assert SBT_CACHE_TPL.exists()
+    data = yaml.safe_load(SBT_CACHE_TPL.read_text())
+    steps = data["steps"]
+    tasks = [s for s in steps if s.get("task", "").startswith("Cache@2")]
+    assert len(tasks) == 3, "expected boot + ivy + Coursier cache steps"
+    keys = [t["inputs"]["key"] for t in tasks]
+    paths = [t["inputs"]["path"] for t in tasks]
+    # Boot cache invalidates on the pinned sbt version.
+    assert any("build.properties" in k and "sbtboot" in k for k in keys)
+    # Dependency caches invalidate on every root/project sbt definition.
+    dependency_keys = [k for k in keys if "sbtboot" not in k]
+    assert all("project/*.sbt" in k for k in dependency_keys)
+    assert all("**/build.sbt" in k for k in dependency_keys)
+    assert all("project/**/*.scala" in k for k in dependency_keys)
+    assert any(".sbt/boot" in p for p in paths)
+    assert any(".ivy2/cache" in p for p in paths)
+    assert any(".cache/coursier" in p for p in paths)
+    assert all(t["inputs"].get("cacheHitVar") for t in tasks)
+    # Cache miss/corruption must fall back safely, not fail the job.
+    for t in tasks:
+        assert t.get("continueOnError") is True
+    fallback_scripts = [
+        s.get("bash", "")
+        for s in steps
+        if isinstance(s, dict) and s.get("displayName") == "Ensure sbt cache is usable"
+    ]
+    assert len(fallback_scripts) == 1
+    fallback_script = fallback_scripts[0]
+    stagger_export = "export SBT_SETUP_MAX_STAGGER_SECONDS=0"
+    assert stagger_export in fallback_script
+    assert 'bash "$SBT_RETRY_SCRIPT_PATH" update' in fallback_script
+    assert fallback_script.index(stagger_export) < fallback_script.index(
+        'bash "$SBT_RETRY_SCRIPT_PATH" update'
+    )
+    assert 'if [ "$exact_hit" != "true" ]' in fallback_script
+    parameters = {parameter["name"]: parameter for parameter in data["parameters"]}
+    assert parameters["retryScriptPath"]["default"] == "tools/ci/sbt_retry.sh"
+
+    fallback_step = next(
+        s
+        for s in steps
+        if isinstance(s, dict) and s.get("displayName") == "Ensure sbt cache is usable"
+    )
+    for cache_hit_var in (
+        "SBT_BOOT_CACHE_RESTORED",
+        "SBT_IVY_CACHE_RESTORED",
+        "SBT_COURSIER_CACHE_RESTORED",
+    ):
+        assert f"$({cache_hit_var})" in fallback_step["env"].values()
+    assert (
+        fallback_step["env"]["SBT_RETRY_SCRIPT_PATH"]
+        == "${{ parameters.retryScriptPath }}"
+    )
+
+
+def test_sbt_retry_script_referenced_and_exists():
+    assert SBT_RETRY.exists()
+    assert SBT_VERSION.exists()
+    txt = _pipeline_text()
+    assert "tools/ci/sbt_retry.sh" in txt
+    assert "tools/ci/get_sbt_version.sh" in txt
+
+
+def test_publish_template_repairs_poisoned_cache_before_packaging():
+    data = yaml.safe_load(PUBLISH_TPL.read_text())
+    script = data["steps"][0]["inputs"]["inlineScript"]
+    recovery = "SBT_SETUP_MAX_STAGGER_SECONDS=0 bash tools/ci/sbt_retry.sh update"
+
+    assert recovery in script
+    assert script.index(recovery) < script.index("sbt packagePython")
+    assert script.index("sbt packagePython") < script.index("sbt publishBlob")
+
+
+def test_no_dormant_ivy_cache_placeholders_remain():
+    txt = _pipeline_text()
+    assert "ivy_cache" not in txt, "dormant ivy_cache placeholders should be replaced"
+
+
+def test_no_duplicated_inline_setup_retry_remains():
+    txt = _pipeline_text()
+    # Old duplicated idioms removed in favour of the shared helper.
+    assert "retry_sbt_setup()" not in txt
+    assert '(timeout 5m sbt setup) || (echo "retrying"' not in txt
+
+
+def test_prewarm_job_present():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    assert "BuildAndCacheSbt" in jobs
+    assert "BuildAndCacheCondaEnv" not in jobs
+    prewarm = jobs["BuildAndCacheSbt"]
+    assert "condition" not in prewarm, "prewarm must run whenever sbt jobs can run"
+    cache_steps = [
+        step
+        for step in prewarm["steps"]
+        if isinstance(step, dict) and step.get("template") == "templates/sbt_cache.yml"
+    ]
+    assert len(cache_steps) == 1
+    assert cache_steps[0]["parameters"] == {
+        "prewarm": True,
+        "maxAttempts": 7,
+        "maxBackoffSeconds": 180,
+    }
+
+
+def test_databricks_e2e_uses_fail_open_pr_impact_detection():
+    assert TEST_IMPACT.exists()
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    prewarm = jobs["BuildAndCacheSbt"]
+    databricks_cpu = jobs["DatabricksCPUE2E"]
+    databricks_gpu = jobs["DatabricksGPUE2E"]
+
+    detection_steps = [
+        step
+        for step in prewarm["steps"]
+        if isinstance(step, dict) and step.get("name") == "detectTestImpact"
+    ]
+    assert len(detection_steps) == 1
+    detection_script = detection_steps[0]["bash"]
+    assert "python3 tools/ci/e2e_impact.py" in detection_script
+    assert "set -euo pipefail" in detection_script
+
+    for job, suite in ((databricks_cpu, "Cpu"), (databricks_gpu, "Gpu")):
+        condition = job["condition"]
+        assert "succeeded()" in condition
+        assert "variables.runTests" in condition
+        assert "parameters.testDatabricksE2E" in condition
+        assert (
+            "dependencies.BuildAndCacheSbt.outputs"
+            f"['detectTestImpact.runDatabricks{suite}E2E']"
+        ) in condition
+        assert "DATABRICKS_SUITE" not in condition
+        assert job["steps"] == [{"template": "templates/databricks_e2e_steps.yml"}]
+
+    assert len(databricks_cpu["strategy"]["matrix"]) == 5
+    assert "strategy" not in databricks_gpu
+    assert (
+        databricks_gpu["variables"]["TEST-CLASS"]
+        == "com.microsoft.azure.synapse.ml.nbtest.DatabricksGPUTests"
+    )
+
+    steps = yaml.safe_load(DATABRICKS_STEPS_TPL.read_text())["steps"]
+    assert any(step.get("displayName") == "E2E" for step in steps)
+    assert any(step.get("displayName") == "Publish Test Results" for step in steps)
+
+
+def test_fabric_e2e_cleans_stale_artifacts_before_running_tests():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    fabric_e2e = jobs["FabricE2E"]
+    e2e_steps = [
+        step
+        for step in fabric_e2e["steps"]
+        if isinstance(step, dict) and step.get("displayName") == "E2E"
+    ]
+    assert len(e2e_steps) == 1
+    cleanup_steps = [
+        step
+        for step in fabric_e2e["steps"]
+        if step.get("displayName") == "Fabric cleanup preflight"
+    ]
+    assert len(cleanup_steps) == 1
+    cleanup_step = cleanup_steps[0]
+    steps = fabric_e2e["steps"]
+    assert steps.index(cleanup_step) < steps.index(e2e_steps[0])
+    assert e2e_steps[0]["condition"] == "succeeded()"
+    assert not cleanup_step.get("continueOnError", False)
+    for template in ("templates/fabric_kv.yml", "templates/publish.yml"):
+        setup = next(step for step in steps if step.get("template") == template)
+        assert steps.index(setup) < steps.index(cleanup_step)
+
+    script = e2e_steps[0]["inputs"]["inlineScript"]
+    cleanup_command = (
+        '"testOnly com.microsoft.azure.synapse.ml.nbtest.FabricTestCleanup"'
+    )
+    test_command = (
+        '"testOnly com.microsoft.azure.synapse.ml.nbtest.FabricSmokeTests '
+        'com.microsoft.azure.synapse.ml.nbtest.FabricNotebookTests"'
+    )
+    assert script.count("sbt ") == 1
+    assert cleanup_command not in script
+    assert cleanup_command in cleanup_step["inputs"]["inlineScript"]
+    assert test_command in script
+
+
+def test_fabric_e2e_keeps_key_vault_authentication_and_blocks_forks():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    fabric_e2e = jobs["FabricE2E"]
+
+    condition = fabric_e2e["condition"]
+    assert "succeeded()" in condition
+    assert "variables.runTests" in condition
+    assert "parameters.testFabricE2E" in condition
+    assert "System.PullRequest.IsFork" in condition
+
+    template_steps = {
+        step["template"]: step
+        for step in fabric_e2e["steps"]
+        if isinstance(step, dict) and "template" in step
+    }
+    assert "templates/kv.yml" in template_steps
+    assert "templates/fabric_kv.yml" in template_steps
+    assert "templates/publish.yml" in template_steps
+    bootstrap_filter = _secret_filter(
+        template_steps["templates/kv.yml"]["parameters"]["secretsFilter"]
+    )
+    assert bootstrap_filter == {
+        "fabric-test-kv-name",
+        "fabric-cert-kv-name",
+        "ado-feed-token",
+        "nexus-un",
+        "nexus-pw",
+        "pgp-private",
+        "pgp-public",
+        "pgp-pw",
+    }
+
+    live_steps = [
+        step
+        for step in fabric_e2e["steps"]
+        if step.get("displayName") in ("Fabric cleanup preflight", "E2E")
+    ]
+    expected_env = {
+        "INTEGRATION_ENV": "$(sempy-integration-region)",
+        "INTEGRATION_ACCOUNT": "$(sempy-integration-account)",
+        "INTEGRATION_CERTIFICATE": "$(sempy-integration-certificate)",
+        "INTEGRATION_WORKSPACE_PREFIX": "$(sempy-integration-workspace-prefix)",
+    }
+    assert len(live_steps) == 2
+    for step in live_steps:
+        assert step["env"] == expected_env
+        assert step["inputs"]["azureSubscription"] == "SynapseML Build"
+        script = step["inputs"]["inlineScript"]
+        assert "fabric-spark-cli" not in script
+        assert "INTEGRATION_AUTH_MODE" not in script
+    assert "authentication=key-vault" in live_steps[0]["inputs"]["inlineScript"]
+    assert "fabricE2EAuthMode" not in _pipeline_text()
+
+    key_vault_template = yaml.safe_load(KEY_VAULT_TPL.read_text())
+    parameters = {
+        parameter["name"]: parameter for parameter in key_vault_template["parameters"]
+    }
+    assert parameters["secretsFilter"]["default"] == "*"
+    bootstrap_task = key_vault_template["steps"][0]
+    assert bootstrap_task["inputs"]["keyVaultName"] == "mmlspark-keys"
+    assert bootstrap_task["inputs"]["SecretsFilter"] == (
+        "${{ parameters.secretsFilter }}"
+    )
+
+    fabric_template = yaml.safe_load(FABRIC_KEY_VAULT_TPL.read_text())
+    assert len(fabric_template["steps"]) == 2
+    credential_task, certificate_task = fabric_template["steps"]
+    assert credential_task["inputs"]["KeyVaultName"] == "$(fabric-test-kv-name)"
+    assert _secret_filter(credential_task["inputs"]["SecretsFilter"]) == {
+        "sempy-integration-region",
+        "sempy-integration-account",
+        "sempy-integration-workspace-prefix",
+    }
+    certificate_script = certificate_task["inputs"]["inlineScript"]
+    assert "set -euo pipefail" in certificate_script
+    assert 'certificate_secret_name="${username}-${tenant}"' in certificate_script
+    assert '--vault-name "$FABRIC_CERT_KEY_VAULT_NAME"' in certificate_script
+    assert '--name "$certificate_secret_name"' in certificate_script
+    assert "--only-show-errors" in certificate_script
+    assert "Fabric integration certificate was empty." in certificate_script
+    assert "Computed certificate secret name" not in certificate_script
+    assert certificate_task["env"] == {
+        "FABRIC_CERT_KEY_VAULT_NAME": "$(fabric-cert-kv-name)",
+        "INTEGRATION_ACCOUNT": "$(sempy-integration-account)",
+    }
+    publish_template = yaml.safe_load(PUBLISH_TPL.read_text())
+    assert publish_template["steps"][0]["env"]["ADO-FEED-TOKEN"] == (
+        "$(ado-feed-token)"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="certificate retrieval requires Bash")
+def test_fabric_certificate_lookup_derives_the_existing_secret_name(tmp_path):
+    result, az_args = _run_fabric_certificate_script(
+        tmp_path, "test-admin@test-tenant.onmicrosoft.com"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "##vso[task.setvariable variable=sempy-integration-certificate;"
+        "issecret=true]test-pfx\n"
+    )
+    assert "test-admin-test-tenant" not in result.stdout
+    assert az_args.read_text().splitlines() == [
+        "keyvault",
+        "secret",
+        "show",
+        "--vault-name",
+        "test-cert-vault",
+        "--name",
+        "test-admin-test-tenant",
+        "--query",
+        "value",
+        "--output",
+        "tsv",
+        "--only-show-errors",
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="certificate retrieval requires Bash")
+@pytest.mark.parametrize(
+    ("account", "certificate", "az_exit", "expected_error"),
+    [
+        ("not-an-account", "test-pfx", 0, "must use the username@tenant format"),
+        ("test@test@tenant", "test-pfx", 0, "must use the username@tenant format"),
+        (
+            "test-admin@test-tenant.onmicrosoft.com",
+            "",
+            0,
+            "certificate was empty",
+        ),
+        (
+            "test-admin@test-tenant.onmicrosoft.com",
+            "test-pfx",
+            17,
+            None,
+        ),
+    ],
+)
+def test_fabric_certificate_lookup_fails_closed(
+    tmp_path, account, certificate, az_exit, expected_error
+):
+    result, az_args = _run_fabric_certificate_script(
+        tmp_path, account, certificate=certificate, az_exit=az_exit
+    )
+
+    assert result.returncode != 0
+    if expected_error:
+        assert expected_error in result.stderr
+    if "@" not in account:
+        assert not az_args.exists()
+
+
+def test_fabric_e2e_retains_results_and_metadata_on_failure():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    steps = jobs["FabricE2E"]["steps"]
+
+    e2e = next(step for step in steps if step.get("displayName") == "E2E")
+    script = e2e["inputs"]["inlineScript"]
+    assert "run-metadata.txt" in script
+    assert "e2e_step=preparing" in script
+    assert "e2e_step=running" in script
+    assert "e2e_step=finished" in script
+    assert "sbt_exit_code=$?" in script
+    assert 'exit "$sbt_exit_code"' in script
+    assert not re.search(r'(?<!>)> "\$artifact_root/run-metadata.txt"', script)
+    cleanup = next(
+        step for step in steps if step.get("displayName") == "Fabric cleanup preflight"
+    )
+    cleanup_script = cleanup["inputs"]["inlineScript"]
+    assert "source_version=$(Build.SourceVersion)" in cleanup_script
+    assert "cleanup_step=preparing" in cleanup_script
+    assert "cleanup_step=running" in cleanup_script
+    assert "cleanup_step=finished" in cleanup_script
+    assert "cleanup_exit_code=$?" in cleanup_script
+    assert 'exit "$cleanup_exit_code"' in cleanup_script
+    assert 'cp "$cleanup_report" "$artifact_root/test-reports/"' in cleanup_script
+
+    collect = next(
+        step
+        for step in steps
+        if step.get("displayName") == "Collect Fabric E2E evidence"
+    )
+    assert collect["condition"] == "always()"
+    assert "INTEGRATION_ACCOUNT" not in collect["bash"]
+    assert "INTEGRATION_CERTIFICATE" not in collect["bash"]
+    assert "e2e_step=not-started" in collect["bash"]
+    assert "cleanup_step=not-started" in collect["bash"]
+    assert "TEST-com.microsoft.azure.synapse.ml.nbtest.Fabric*.xml" in collect["bash"]
+
+    publish_results = next(
+        step for step in steps if step.get("displayName") == "Publish Test Results"
+    )
+    assert publish_results["condition"] == "always()"
+    assert publish_results["inputs"]["failTaskOnFailedTests"] is True
+    assert publish_results["inputs"]["failTaskOnMissingResultsFile"] is True
+    assert publish_results["inputs"]["searchFolder"] == (
+        "$(Build.ArtifactStagingDirectory)/fabric-e2e/test-reports"
+    )
+    assert publish_results["inputs"]["testResultsFiles"] == "TEST-*.xml"
+
+    publish_evidence = next(
+        step
+        for step in steps
+        if step.get("displayName") == "Publish Fabric E2E evidence"
+    )
+    assert publish_evidence["condition"] == "always()"
+    assert publish_evidence["inputs"]["targetPath"] == (
+        "$(Build.ArtifactStagingDirectory)/fabric-e2e"
+    )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Fabric pipeline scripts require Bash")
+@pytest.mark.parametrize("cleanup_exit,e2e_exit", [(0, 0), (17, 0), (0, 23), (None, 0)])
+def test_fabric_preflight_scripts_preserve_exit_codes_and_evidence(
+    tmp_path, cleanup_exit, e2e_exit
+):
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    steps = {step.get("displayName"): step for step in jobs["FabricE2E"]["steps"]}
+    mock_bin = tmp_path / "bin"
+    mock_bin.mkdir()
+    (mock_bin / "activate").write_text("return 0\n")
+    mock_sbt = mock_bin / "sbt"
+    mock_sbt.write_text(
+        """#!/usr/bin/env bash
+set -e
+mkdir -p "$MOCK_REPORTS"
+prefix="$MOCK_REPORTS/TEST-com.microsoft.azure.synapse.ml.nbtest."
+if [[ "$*" == *FabricTestCleanup* ]]; then
+  printf '<testsuite/>\\n' > "${prefix}FabricTestCleanup.xml"
+else
+  rm -f "${prefix}FabricTestCleanup.xml"
+  printf '<testsuite/>\\n' > "${prefix}FabricSmokeTests.xml"
+fi
+exit "$MOCK_SBT_EXIT"
+"""
+    )
+    mock_sbt.chmod(0o755)
+    staging = tmp_path / "staging"
+    source = tmp_path / "source"
+    env = os.environ.copy()
+    env["PATH"] = f"{mock_bin}{os.pathsep}{env['PATH']}"
+    env["MOCK_REPORTS"] = str(source / "core" / "target" / "test-reports")
+
+    def run_step(name, exit_code):
+        step = steps[name]
+        script = step.get("bash", step.get("inputs", {}).get("inlineScript"))
+        for key, value in {
+            "$(Build.ArtifactStagingDirectory)": str(staging),
+            "$(Build.SourcesDirectory)": str(source),
+            "$(Build.SourceVersion)": "test-source-sha",
+        }.items():
+            script = script.replace(key, value)
+        return subprocess.run(
+            ["bash", "-c", script],
+            env={**env, "MOCK_SBT_EXIT": str(exit_code)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    if cleanup_exit is not None:
+        cleanup = run_step("Fabric cleanup preflight", cleanup_exit)
+        assert cleanup.returncode == cleanup_exit, cleanup.stderr
+    if cleanup_exit == 0:
+        e2e = run_step("E2E", e2e_exit)
+        assert e2e.returncode == e2e_exit, e2e.stderr
+    collect = run_step("Collect Fabric E2E evidence", 0)
+    assert collect.returncode == 0, collect.stderr
+    artifact_root = staging / "fabric-e2e"
+    metadata = (artifact_root / "run-metadata.txt").read_text()
+    assert "source_version=test-source-sha" in metadata
+    if cleanup_exit is None:
+        assert "cleanup_step=not-started" in metadata
+        assert "e2e_step=not-started" in metadata
+        assert "cleanup_exit_code=" not in metadata
+        assert not list((artifact_root / "test-reports").glob("*.xml"))
+        return
+    assert f"cleanup_exit_code={cleanup_exit}" in metadata
+    assert "cleanup_step=finished" in metadata
+    if cleanup_exit:
+        assert "e2e_step=not-started" in metadata
+        assert "e2e_step=running" not in metadata
+    else:
+        assert "e2e_step=finished" in metadata
+        assert "e2e_step=not-started" not in metadata
+        assert f"sbt_exit_code={e2e_exit}" in metadata
+    assert (
+        artifact_root
+        / "test-reports"
+        / "TEST-com.microsoft.azure.synapse.ml.nbtest.FabricTestCleanup.xml"
+    ).is_file()
+    assert (
+        artifact_root
+        / "test-reports"
+        / "TEST-com.microsoft.azure.synapse.ml.nbtest.FabricSmokeTests.xml"
+    ).is_file() == (cleanup_exit == 0)
+
+
+def test_internal_python_adapts_typing_package_data_to_current_codegen():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    internal = jobs["InternalCompat"]
+    retarget_step = next(
+        step
+        for step in internal["steps"]
+        if isinstance(step, dict)
+        and step.get("displayName") == "Retarget Internal to this build"
+    )
+
+    script = retarget_step["bash"]
+    assert 'if [ "$COMPAT_LANE" = "python" ]; then' in script
+    assert '"": ["*.pyi", "py.typed"]' in script
+    assert (
+        'python "$(Agent.BuildDirectory)/s/tools/ci/'
+        'patch_internal_typing_support.py"' in script
+    )
+    assert "utils/typing_build_support.py" in script
+
+
+def test_internal_python_isolates_typing_from_spark_tests():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    internal = jobs["InternalCompat"]
+    test_step = next(
+        step
+        for step in internal["steps"]
+        if isinstance(step, dict)
+        and step.get("displayName") == "Run Internal Python compatibility tests"
+    )
+
+    script = test_step["inputs"]["inlineScript"]
+    assert '--ignore=typing"' in script
+    assert "sbt testPythonAIFuncCommon" in script
+    assert "sbt testPythonExcludeAIFunc" not in script
+    assert "COMPAT_LANE" in test_step["condition"]
+    assert "python" in test_step["condition"]
+
+
+@pytest.mark.parametrize(
+    "template,step_name",
+    [
+        (FABRIC_KEY_VAULT_TPL, "Get Fabric Test Credentials from Key Vault"),
+        (FABRIC_KEY_VAULT_TPL, "Get Fabric Test Certificate from Key Vault"),
+        (
+            REPO_ROOT / "templates" / "publish_coverage_ado.yml",
+            "Publish Code Coverage to Azure DevOps",
+        ),
+    ],
+)
+def test_external_ci_steps_retry_without_ignoring_failures(template, step_name):
+    data = yaml.safe_load(template.read_text())
+    step = next(item for item in data["steps"] if item.get("displayName") == step_name)
+    assert step["retryCountOnTaskFailure"] == 2
+    assert not step.get("continueOnError", False)
+    if step_name == "Publish Code Coverage to Azure DevOps":
+        parameter = next(
+            item for item in data["parameters"] if item["name"] == "failIfCoverageEmpty"
+        )
+        assert parameter["default"] is True
+        assert step["inputs"]["failIfCoverageEmpty"] == (
+            "${{ parameters.failIfCoverageEmpty }}"
+        )
+
+
+def test_acr_cleanup_is_schedule_only_and_uses_dedicated_identity():
+    data = yaml.safe_load(CLEAN_ACR_PIPELINE.read_text())
+    assert data["trigger"] == "none"
+    assert data["pr"] == "none"
+    assert data["variables"]["azureServiceConnection"] == "synapseml-clean-acr"
+
+    cleanup = next(
+        step for step in data["steps"] if step.get("displayName") == "Clean ACR"
+    )
+    assert cleanup["inputs"]["azureSubscription"] == "$(azureServiceConnection)"
+    script = cleanup["inputs"]["inlineScript"]
+    assert "pip install" not in script
+    assert "clean-acr-connection-string" not in script
+    assert "python tools/acr/clean_acr.py" in script
+
+
+def test_non_azure_setup_steps_do_not_authenticate_with_azure_cli():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    expected_bash_steps = {
+        "Style": {"Scala Style Check"},
+        "BuildDocker": {"Get Docker Tag + Version"},
+        "PythonTests": {"Install and package deps", "Generate Codecov report"},
+        "RTests": {"Prepare for tests", "Generate Codecov report"},
+        "WebsiteSamplesTests": {"Generate Codecov report"},
+        "UnitTests": {"Setup repo", "Generate Codecov report"},
+    }
+
+    for job_name, display_names in expected_bash_steps.items():
+        steps = jobs[job_name]["steps"]
+        for display_name in display_names:
+            step = next(
+                step for step in steps if step.get("displayName") == display_name
+            )
+            assert "bash" in step, f"{job_name}/{display_name} should be a Bash step"
+            assert step.get("task") != "AzureCLI@2"
+
+
+def test_build_docker_allows_time_for_both_image_builds():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    assert jobs["BuildDocker"]["timeoutInMinutes"] >= 120
+
+
+def test_build_docker_reuses_bootstrap_layers_and_emits_progress():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    image_builds = [
+        step
+        for step in jobs["BuildDocker"]["steps"]
+        if step.get("displayName") in {"Demo Image Build", "Minimal Image Build"}
+    ]
+
+    assert len(image_builds) == 2
+    for step in image_builds:
+        assert "--quiet" not in step["inputs"]["arguments"]
+        assert (
+            "--build-arg PYTHON_VERSION=$(pythonVersion)" in step["inputs"]["arguments"]
+        )
+        assert step["env"]["DOCKER_BUILDKIT"] == "1"
+        assert step["env"]["BUILDKIT_PROGRESS"] == "plain"
+
+    version_step = next(
+        step
+        for step in jobs["BuildDocker"]["steps"]
+        if step.get("displayName") == "Get Docker Tag + Version"
+    )
+    assert "tools/ci/get_python_version.sh" in version_step["bash"]
+    assert "variable=pythonVersion" in version_step["bash"]
+
+    dependency_marker = "# SYNAPSEML_BOOTSTRAP_END"
+    demo_bootstrap, separator, _ = DEMO_DOCKERFILE.read_text().partition(
+        dependency_marker
+    )
+    assert separator
+    minimal_bootstrap, separator, _ = MINIMAL_DOCKERFILE.read_text().partition(
+        dependency_marker
+    )
+    assert separator
+    assert demo_bootstrap == minimal_bootstrap
+    assert "pip install --no-cache-dir" in DEMO_DOCKERFILE.read_text()
+    assert "pip install --no-cache-dir" in MINIMAL_DOCKERFILE.read_text()
+    assert 'conda install -y "python=${PYTHON_VERSION}"' in DEMO_DOCKERFILE.read_text()
+    assert (
+        'conda install -y "python=${PYTHON_VERSION}"' in MINIMAL_DOCKERFILE.read_text()
+    )
+    assert "PYTHON_VERSION build argument is required" in DEMO_DOCKERFILE.read_text()
+    assert "PYTHON_VERSION build argument is required" in MINIMAL_DOCKERFILE.read_text()
+
+
+def test_publish_jobs_resolve_and_preserve_package_versions():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+
+    publish = jobs["Publish"]
+    publish_steps = publish["steps"]
+    assert any(step.get("task") == "MavenAuthenticate@0" for step in publish_steps)
+    assert any(step.get("template") == "templates/conda.yml" for step in publish_steps)
+    assert any(step.get("template") == "templates/kv.yml" for step in publish_steps)
+    version_step = next(
+        step
+        for step in publish_steps
+        if step.get("displayName") == "Resolve package version"
+    )
+    assert "get_sbt_version.sh" in version_step["bash"]
+    artifact_step = next(
+        step for step in publish_steps if step.get("displayName") == "Publish Artifacts"
+    )
+    artifact_script = artifact_step["inputs"]["inlineScript"]
+    for task in (
+        "packagePython uploadNotebooks",
+        "publishBlob publishDocs publishR publishPython",
+        "publishLocalSigned",
+    ):
+        assert task in artifact_script
+    assert artifact_step["env"]["SYNAPSEML_ENABLE_PUBLISH"] is True
+    assert "$(packageVersion)" in artifact_script
+
+    release = jobs["Release"]
+    release_steps = release["steps"]
+    release_version = next(
+        step
+        for step in release_steps
+        if step.get("displayName") == "Validate release package version"
+    )
+    assert "get_sbt_version.sh" in release_version["bash"]
+    assert 'EXPECTED_VERSION="${RELEASE_TAG#v}"' in release_version["bash"]
+    assert "PACKAGE_VERSION" in release_version["bash"]
+    release_guard_index = release_steps.index(release_version)
+    side_effect_steps = [
+        next(step for step in release_steps if "git-chglog" in step.get("bash", "")),
+        next(step for step in release_steps if step.get("task") == "GitHubRelease@1"),
+        next(step for step in release_steps if "publishPypi" in step.get("bash", "")),
+        next(
+            step
+            for step in release_steps
+            if "publishLocalSigned" in step.get("bash", "")
+        ),
+        next(
+            step
+            for step in release_steps
+            if step.get("displayName") == "ESRP Publish Package"
+        ),
+    ]
+    assert all(
+        release_guard_index < release_steps.index(step) for step in side_effect_steps
+    )
+
+
+def test_style_does_not_restore_the_full_conda_environment():
+    data = yaml.safe_load(_pipeline_text())
+    jobs = {j.get("job"): j for j in _jobs(data["jobs"])}
+    style = jobs["Style"]
+    templates = [step.get("template") for step in style["steps"] if "template" in step]
+    assert "templates/conda.yml" not in templates
+    python_style = next(
+        step
+        for step in style["steps"]
+        if step.get("displayName") == "Python Style Check"
+    )
+    assert "black[jupyter]==22.3.0" in python_style["bash"]
+
+
+def test_every_sbt_running_job_waits_for_the_prewarm_cache():
+    """Each sbt job must restore the cache after the required prewarm job."""
+    data = yaml.safe_load(_pipeline_text())
+
+    def flatten(obj):
+        out = []
+        if isinstance(obj, dict):
+            for v in obj.values():
+                out += flatten(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                out += flatten(v)
+        elif isinstance(obj, str):
+            out.append(obj)
+        return out
+
+    offenders = []
+    for job in _jobs(data["jobs"]):
+        if job["job"] == "BuildAndCacheSbt":
+            continue
+        steps = job.get("steps", [])
+        texts = flatten(steps)
+        runs_sbt = any(
+            "sbt " in t or t.strip().startswith("sbt") or "sbt_retry.sh" in t
+            for t in texts
+        )
+        templates = [
+            s.get("template")
+            for s in steps
+            if isinstance(s, dict) and s.get("template")
+        ]
+        uses_cache = "templates/sbt_cache.yml" in templates
+        depends_on = job.get("dependsOn", [])
+        if isinstance(depends_on, str):
+            depends_on = [depends_on]
+        condition = job.get("condition")
+        gated_by_success = condition is None or "succeeded()" in condition
+        if runs_sbt and (
+            not uses_cache
+            or "BuildAndCacheSbt" not in depends_on
+            or not gated_by_success
+        ):
+            offenders.append(job.get("job"))
+    assert not offenders, f"sbt jobs missing required cache gate: {offenders}"

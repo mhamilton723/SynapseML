@@ -1,0 +1,153 @@
+# Merge-readiness gates
+
+A SynapseML PR is engineering-ready only when every applicable gate is backed
+by current-head evidence.
+
+## Integration
+
+- Matching branch context was checked at start, before validation, and before
+  final push against the target branch's live build and CI files.
+- Head is based on the latest target SHA and is not behind.
+- Conflicts are resolved by combining independent changes, not choosing a side
+  wholesale.
+- The intended patch remains equivalent after rebase/conflict resolution.
+- For overlapping PRs, merge order is explicit and downstream PRs are
+  revalidated after predecessors merge.
+- Local, remote, and GitHub head SHAs match.
+- Recently closed/merged related work was checked; valuable follow-ups are
+  rebased and revalidated, while superseded PRs are closed with an explanation.
+
+## User value and scope
+
+- Every changed file and hunk must support an acceptance criterion, fix a
+  demonstrated defect, or satisfy a repository requirement. Remove useless files,
+  unrelated cleanup, speculative abstractions, duplicate documentation, and filler.
+  Keep focused tests and necessary evidence; do not trade correctness or
+  traceability for a smaller line count. Prune superseded review artifacts only
+  under the [retention policy](loop-control.md#artifact-retention).
+  Record this full-diff scope audit in the checkpoint.
+- The title and opening description accurately explain the current change and
+  user value to a human reader; deeper technical evidence follows afterward.
+- The opening makes the what and why clear without the diff. Visuals clarify
+  real behavior where useful; risks and current validation status stay visible
+  rather than being hidden in expandable details.
+- The original issue and every material discussion point are addressed.
+- The behavior is reachable through the published artifact and public API.
+- Defaults remain backward compatible, or the intentional change is documented.
+- Unsupported cases fail early with actionable errors; no success-shaped
+  fallback hides missing capability.
+- Documentation describes what is shipped, not a custom validation artifact or
+  an unbundled native/provider.
+- Fulfilled linked issues are updated/closed, while distinct unresolved scope
+  remains open and explicit.
+
+## Correctness and compatibility
+
+- Runtime output matches `transformSchema`.
+- `copy`, save/load, Params, generated Python, hand-written Python, and other
+  language bindings preserve behavior.
+- Public JVM signatures and serialized shapes pass compatibility review.
+- Shared serializers, request models, evaluators, and sibling API variants are
+  checked for the same defect.
+- Native/service behavior is verified past the wrapper boundary.
+
+## Test quality
+
+- A regression test demonstrates the old failure.
+- Public end-to-end behavior is tested, not only helpers.
+- Positive, negative, null/empty, malformed, boundary, and cleanup paths are
+  covered where relevant.
+- Tests assert values, schemas, ordering, resource cleanup, and errors rather
+  than only "no exception".
+- Generated wrappers compile/import, and Python tests exercise the supported
+  surface when user-facing APIs change.
+- Real environment tests exist when emulation cannot prove the claim.
+
+## Performance and Spark
+
+- No driver collection, accidental cross join, unbounded materialization,
+  per-row client/model construction, or unnecessary repartition/shuffle is
+  introduced.
+- DataFrame/Dataset and Spark SQL built-ins are preferred over RDDs and UDFs.
+- Cache/persist/broadcast/native resources have bounded lifetimes and cleanup.
+- Network/native concurrency has bounds, backpressure, timeout, retry, and
+  terminal failure behavior.
+- Representative before/after measurements show no material regression for a
+  changed hot path.
+
+## Review and validation
+
+- For external or unverified authors, the full trusted external-contributor
+  review skill was applied, including its conditional CI delegation, review-only
+  opt-out, scoped follow-up
+  permissions, authorship/history preservation, discussion rules, and handoff.
+  Safety clearance alone does not satisfy this gate or authorize CI. Missing
+  permission leaves the affected action blocked, not silently completed.
+- The fast test/review/comment/CI loop passed before the final expensive review.
+- The installed `/review-code` direct contract completed a final CI-qualified
+  pass with all six rounds clean
+  on the same final patch, with actual models and versioned review artifacts.
+  A later fix invalidates earlier results as specified in
+  [loop control](loop-control.md#evidence-invalidation).
+- The checkpoint records remaining risks and the exact source/target pair.
+  Exhausted budgets and unavailable reviewers are blockers, not clean reviews.
+- The dedicated worktree is clean, and the normalized reviewed-file manifest
+  recomputed from the final HEAD matches the frozen review manifest.
+- These evidence gates do not authorize CI. `/azp run`, `-RunPipeline`,
+  workflow approval, and manual queueing require explicit CI authorization
+  and, for external PRs, a fresh trusted safety check of the exact head.
+  When CI is required, missing prerequisites leave it blocked; stay read-only.
+  Apply the [Azure scope exception](../SKILL.md#7-run-and-triage-full-ci)
+  before requiring a build or requesting a trigger.
+  Every comment trigger must also satisfy the
+  [comment-trigger gate](ci-evidence.md#comment-trigger-gate).
+  A qualifying request under the trusted contributor skill can supply the CI
+  grant, subject to its revision and resource restrictions. Validation-only
+  completion is not full engineering readiness and grants no editing authority.
+- Active review threads: zero.
+- No blocking review decision, requested-change vote, ownership gate, or
+  required coverage failure remains.
+- Suppressed/minimized Copilot feedback was read and either fixed or rebutted
+  with evidence. Read it from the review body for the current head; it never
+  appears as a review thread, so a zero-thread query does not clear this gate.
+- Latest automated review covers the final head, compared by commit rather than
+  by recency. A review produced before the last push does not clear the two
+  gates above, because it never saw that code.
+- Targeted tests, compile, test compile, style, Black, codegen, Python, and
+  port-branch compatibility pass as applicable.
+- Applicable Azure Pipelines and required GitHub checks are complete with zero
+  unexplained failures or pending jobs.
+- When Azure validation is required, its build is present on the current head.
+  It does not queue itself on a push here, and green GitHub Actions alone are not full CI.
+  Confirm the Azure build by name against the head SHA, not by the absence of
+  red. A missing build remains a blocker; request it only after the authorization
+  and safety prerequisites above are satisfied.
+- For an exempt diff, record Azure validation as not required, not passed.
+  Keep any conflicting enforced GitHub check visible as a merge-policy mismatch.
+  The helper always requires `microsoft.SynapseML`, even without a matching
+  GitHub rule, so an absent Azure run leaves its summary readiness states and
+  `completeness.complete` blocked/false. With complete policy evidence, classify
+  the missing aggregate as an enforced mismatch only when it appears in
+  `ruleRequiredChecks[].context` or `classicProtection.required_status_checks`;
+  otherwise it is only the helper's built-in requirement. Incomplete policy
+  evidence remains unknown, not exempt from inspection.
+  Assess all other gates from their own fields: other missing/unproven checks,
+  `failedChecks`, `pendingChecks`, workflow results and approvals, review threads,
+  `completeness.automatedReviewCoversHead`, `behindBy`, `mergeable`, and
+  `readiness.unassessedGates`. Never cite or rewrite the blocked summary as clear.
+- Skips are expected and documented; a skipped required scenario is a blocker.
+- Inspect workflow runs as well as check rollups: `action_required` may have no
+  visible job check. Effective rulesets/classic protection supply approval and
+  required-check gates. Missing permission to inspect rules is unknown, not clear.
+- Use the [separate readiness states](ci-evidence.md#github-snapshot) from
+  `Get-PrReadiness.ps1`. `completeness.complete` is only a compatibility alias
+  for remote engineering gates, not a decision on all gates above or merge
+  approval. Actual tests, local behavior, review dispositions, and issuer
+  identities still need evidence; human approval is reported independently.
+
+## Honest confidence language
+
+Use "5/5 engineering confidence" only with the evidence above. State residual
+risk explicitly: external service variability, unowned infrastructure, hardware
+not available for validation, or required human approval. Never claim absolute
+certainty.

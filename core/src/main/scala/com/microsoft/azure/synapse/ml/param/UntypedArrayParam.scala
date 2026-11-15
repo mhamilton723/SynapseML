@@ -6,6 +6,7 @@ package com.microsoft.azure.synapse.ml.param
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.ml.param.{Param, ParamPair, Params}
 import spray.json.{DefaultJsonProtocol, JsValue, JsonFormat, _}
+import scala.collection.immutable.ListMap
 
 import scala.collection.JavaConverters._
 
@@ -13,33 +14,45 @@ object AnyJsonFormat extends DefaultJsonProtocol {
 
   //scalastyle:off cyclomatic.complexity
   implicit def anyFormat: JsonFormat[Any] = {
-    def throwFailure(any: Any) = throw new IllegalArgumentException(s"Cannot serialize ${any} of type ${any.getClass}")
+    def throwFailure(any: Any): Nothing = {
+      val valueType = if (any == null) "null" else any.getClass.toString
+      throw new IllegalArgumentException(s"Cannot serialize $any of type $valueType")
+    }
 
     new JsonFormat[Any] {
       def write(any: Any): JsValue = any match {
+        case v if v == null => JsNull
         case v: Int => v.toJson
+        case v: Long => v.toJson
+        case v: Short => v.toJson
+        case v: Byte => v.toJson
+        case v: Float => v.toJson
         case v: Double => v.toJson
+        case v: BigDecimal => JsNumber(v)
+        case v: java.math.BigDecimal => JsNumber(BigDecimal(v))
         case v: String => v.toJson
         case v: Boolean => v.toJson
         case v: Integer => v.toLong.toJson
         case v: Seq[_] => seqFormat[Any].write(v)
         case v: Map[_, _] => {
-          try {
-            mapFormat[String, Any].write(v.asInstanceOf[Map[String, Any]])
-          } catch {
-            case _: Throwable => throwFailure(any)
+          val fields = v.toSeq.map {
+            case (key: String, value) => key -> write(value)
+            case (key, _) => throwFailure(key)
           }
+          // mapFormat rebuilds larger objects as HashMap, losing schema property order.
+          JsObject(ListMap(fields: _*))
         }
         case _ => throwFailure(any)
       }
 
       def read(value: JsValue): Any = value match {
+        case JsNull => Option.empty[AnyRef].orNull
         case v: JsNumber =>
           val num = v.value
           num match {
             case _ if num.isValidInt => num.toInt
             case _ if num.isValidLong => num.toLong
-            case _ if num.isExactDouble || num.isBinaryDouble || num.isDecimalDouble => num.toDouble
+            case _ if num.isDecimalDouble => num.toDouble
             case _ => num
           }
         case v: JsString => v.value

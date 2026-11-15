@@ -120,7 +120,8 @@ case class DistributionMetricsCalculator(refFeatureProbabilities: Array[Double],
     val averageObsRef = (obsFeatureProbabilities, refFeatureProbabilities).zipped.map((a, b) => (a + b) / 2d)
     val entropyRefAvg = entropy(refFeatureProbabilities, Some(averageObsRef))
     val entropyObsAvg = entropy(obsFeatureProbabilities, Some(averageObsRef))
-    sqrt((entropyRefAvg + entropyObsAvg) / 2d)
+    val jsDivergenceBase2 = (entropyRefAvg + entropyObsAvg) / (2d * log(2d))
+    sqrt(math.max(0d, jsDivergenceBase2))
   }
   val infNormDistance: Double = absDiffObsRef.max
   val totalVariationDistance: Double = 0.5d * absDiffObsRef.sum
@@ -128,8 +129,8 @@ case class DistributionMetricsCalculator(refFeatureProbabilities: Array[Double],
   val chiSquaredTestStatistic: Double = (obsFeatureCounts, refFeatureCounts).zipped.map((a, b) => pow(a - b, 2) / b).sum
   implicit val rand: RandBasis = RandBasis.mt0
   val chiSquaredPValue: Double = chiSquaredTestStatistic match {
-    // limit of CDF as x approaches +inf is 1 (https://en.wikipedia.org/wiki/Cumulative_distribution_function)
-    case Double.PositiveInfinity => 1
+    // The survival probability approaches 0 as the score approaches positive infinity.
+    case Double.PositiveInfinity => 0d
     case _ => 1 - ChiSquared(numFeatures - 1).cdf(chiSquaredTestStatistic)
   }
 

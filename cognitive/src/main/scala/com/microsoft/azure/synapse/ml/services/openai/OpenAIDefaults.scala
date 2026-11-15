@@ -9,6 +9,8 @@ import com.microsoft.azure.synapse.ml.io.http.URLKey
 import com.microsoft.azure.synapse.ml.services.aifoundry.AIFoundryModel
 
 object OpenAIDefaults {
+  private[openai] val DefaultTextDeploymentName: String = "gpt-6-luna"
+
   def setDeploymentName(v: String): Unit = {
     GlobalParams.setGlobalParam(OpenAIDeploymentNameKey, Left(v))
   }
@@ -47,8 +49,7 @@ object OpenAIDefaults {
   }
 
   def setURL(v: String): Unit = {
-    val url = if (v.endsWith("/")) v else v + "/"
-    GlobalParams.setGlobalParam(URLKey, url)
+    GlobalParams.setGlobalParam(URLKey, v)
   }
 
   def getURL: Option[String] = {
@@ -59,6 +60,9 @@ object OpenAIDefaults {
     GlobalParams.resetGlobalParam(URLKey)
   }
 
+  /** Sets a global Chat/Completions seed. Responses rejects this inherited setting;
+    * call resetSeed() before using Responses in the same session.
+    */
   def setSeed(v: Int): Unit = {
     GlobalParams.setGlobalParam(OpenAISeedKey, Left(v))
   }
@@ -106,6 +110,59 @@ object OpenAIDefaults {
 
   def resetModel(): Unit = {
     GlobalParams.resetGlobalParam(AIFoundryModel)
+  }
+
+  def setEmbeddingDeploymentName(v: String): Unit = {
+    GlobalParams.setGlobalParam(OpenAIEmbeddingDeploymentNameKey, Left(v))
+  }
+
+  def getEmbeddingDeploymentName: Option[String] = {
+    extractLeft(GlobalParams.getGlobalParam(OpenAIEmbeddingDeploymentNameKey))
+  }
+
+  def resetEmbeddingDeploymentName(): Unit = {
+    GlobalParams.resetGlobalParam(OpenAIEmbeddingDeploymentNameKey)
+  }
+
+  def setVerbosity(v: String): Unit = {
+    GlobalParams.setGlobalParam(OpenAIVerbosityKey, Left(v))
+  }
+
+  def getVerbosity: Option[String] = {
+    extractLeft(GlobalParams.getGlobalParam(OpenAIVerbosityKey))
+  }
+
+  def resetVerbosity(): Unit = {
+    GlobalParams.resetGlobalParam(OpenAIVerbosityKey)
+  }
+
+  def setReasoningEffort(v: String): Unit = {
+    GlobalParams.setGlobalParam(OpenAIReasoningEffortKey, Left(v))
+  }
+
+  def getReasoningEffort: Option[String] = {
+    extractLeft(GlobalParams.getGlobalParam(OpenAIReasoningEffortKey))
+  }
+
+  def resetReasoningEffort(): Unit = {
+    GlobalParams.resetGlobalParam(OpenAIReasoningEffortKey)
+  }
+
+  def setApiType(v: String): Unit = {
+    val options = Seq("responses", "chat_completions")
+    require(
+      options.contains(v),
+      s"ApiType must be in ${options.mkString(", ")}, got: $v"
+    )
+    GlobalParams.setGlobalParam(OpenAIApiTypeKey, v)
+  }
+
+  def getApiType: Option[String] = {
+    GlobalParams.getGlobalParam(OpenAIApiTypeKey)
+  }
+
+  def resetApiType(): Unit = {
+    GlobalParams.resetGlobalParam(OpenAIApiTypeKey)
   }
 
   private def extractLeft[T](optEither: Option[Either[T, String]]): Option[T] = {

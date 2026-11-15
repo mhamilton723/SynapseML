@@ -28,6 +28,19 @@ object CodegenPlugin extends AutoPlugin {
 
   override def requires: Plugins = CondaPlugin
 
+  private def findBuiltPythonWheel(packageDir: File, projectName: String): File = {
+    val wheelPrefix = s"${projectName.replace("-", "_")}-"
+    val wheels = Option(packageDir.listFiles()).getOrElse(Array.empty).filter { file =>
+      file.isFile &&
+      file.getName.startsWith(wheelPrefix) &&
+      file.getName.endsWith(".whl")
+    }.sortBy(_.lastModified())
+
+    wheels.lastOption.getOrElse {
+      throw new IllegalStateException(s"No built wheel found in ${packageDir.getAbsolutePath} for $projectName")
+    }
+  }
+
   def rCmd(activateCondaEnv: Seq[String], cmd: Seq[String], wd: File, libPath: String): Unit = {
     runCmd(activateCondaEnv ++ cmd, wd, Map("R_LIBS" -> libPath, "R_USER_LIBS" -> libPath))
   }
@@ -65,6 +78,8 @@ object CodegenPlugin extends AutoPlugin {
 
     val packagePython = TaskKey[Unit]("packagePython", "Package python sdk")
     val installPipPackage = TaskKey[Unit]("installPipPackage", "install python sdk")
+    val preparePythonTests = TaskKey[Unit]("preparePythonTests",
+      "install local python packages required by tests")
     val removePipPackage = TaskKey[Unit]("removePipPackage",
       "remove the installed synapseml pip package from local env")
 
@@ -236,11 +251,17 @@ object CodegenPlugin extends AutoPlugin {
       codegen.value
       createCondaEnvTask.value
       val destPyDir = join(targetDir.value, "classes", genPackageNamespace.value)
-      val packageDir = join(codegenDir.value, "package", "python").absolutePath
+      val packageDirFile = join(codegenDir.value, "package", "python")
+      val packageDir = packageDirFile.absolutePath
       val pythonSrcDir = join(codegenDir.value, "src", "python")
       if (destPyDir.exists()) FileUtils.forceDelete(destPyDir)
       val sourcePyDir = join(pythonSrcDir.getAbsolutePath, genPackageNamespace.value)
       FileUtils.copyDirectory(sourcePyDir, destPyDir)
+      Option(packageDirFile.listFiles()).getOrElse(Array.empty).foreach { file =>
+        if (file.isFile && file.getName.startsWith(s"${name.value.replace("-", "_")}-") && file.getName.endsWith(".whl")) {
+          FileUtils.forceDelete(file)
+        }
+      }
       packagePythonWheelCmd(packageDir, pythonSrcDir)
     },
     removePipPackage := {
@@ -250,18 +271,27 @@ object CodegenPlugin extends AutoPlugin {
       val packagePythonResult: Unit = packagePython.value
       val publishLocalResult: Unit = (publishLocal dependsOn packagePython).value
       val rootPublishLocalResult: Unit = (LocalRootProject / Compile / publishLocal).value
+      val packageDir = join(codegenDir.value, "package", "python")
+      val wheel = findBuiltPythonWheel(packageDir, name.value)
       runCmd(
-        activateCondaEnv ++ Seq("pip", "install", "-I",
-          s"${name.value.replace("-", "_")}-${pythonizedVersion(version.value)}-py2.py3-none-any.whl"),
-        join(codegenDir.value, "package", "python"))
+        activateCondaEnv ++ Seq(
+          "pip",
+          "install",
+          "-I",
+          "--no-deps",
+          wheel.getAbsolutePath
+        ),
+        packageDir)
     },
     publishPython := {
       val packagePythonResult: Unit = packagePython.value
       val publishLocalResult: Unit = (publishLocal dependsOn packagePython).value
       val rootPublishLocalResult: Unit = (LocalRootProject / Compile / publishLocal).value
-      val fn = s"${name.value.replace("-", "_")}-${pythonizedVersion(version.value)}-py2.py3-none-any.whl"
+      val packageDir = join(codegenDir.value, "package", "python")
+      val wheel = findBuiltPythonWheel(packageDir, name.value)
+      val fn = wheel.getName
       singleUploadToBlob(
-        join(codegenDir.value, "package", "python", fn).toString,
+        wheel.toString,
         version.value + "/" + fn, "pip")
     },
     mergePyCode := {
@@ -272,8 +302,20 @@ object CodegenPlugin extends AutoPlugin {
     pyCodegen := pyCodeGenImpl.value,
     pythonIgnoreTestPath := sys.props.get("pythonIgnoreTestPath"),
     pythonSubTestPath := sys.props.get("pythonSubTestPath"),
+    preparePythonTests := Def.taskDyn {
+      if (thisProjectRef.value.project == "core") {
+        Def.task {
+          installPipPackage.value
+        }
+      } else {
+        Def.sequential(
+          LocalProject("core") / installPipPackage,
+          installPipPackage
+        )
+      }
+    }.value,
     testPython := {
-      installPipPackage.value
+      preparePythonTests.value
       pyTestgen.value
       val mainTargetDir = join(baseDirectory.value.getParent, "target")
       val baseTestPath = genTestPackageNamespace.value

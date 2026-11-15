@@ -5,8 +5,7 @@ package org.apache.spark.ml
 
 import com.microsoft.azure.synapse.ml.core.serialize.ComplexParam
 import org.apache.hadoop.fs.Path
-import org.apache.spark.SparkContext
-import org.apache.spark.ml.param.{ParamPair, Params}
+import org.apache.spark.ml.param.{Param, ParamMap, ParamPair, Params}
 import org.apache.spark.ml.util.DefaultParamsReader.Metadata
 import org.apache.spark.ml.util._
 import org.apache.spark.sql.SparkSession
@@ -18,12 +17,33 @@ import org.json4s.{JObject, _}
 trait ComplexParamsWritable extends MLWritable {
   self: Params =>
 
+  /** Constructor-recreated defaults that must remain implicit unless explicitly set, including complex params. */
+  def paramsWithImplicitDefaults: Set[Param[_]] = Set.empty
+
   override def write: MLWriter = new ComplexParamsWriter(this)
 }
 
 trait ComplexParamsReadable[T] extends MLReadable[T] {
 
   override def read: MLReader[T] = new ComplexParamsReader[T]
+}
+
+private[ml] object ComplexParamsJson {
+  def parseExact(json: String): JValue =
+    preserveSignedZero(parse(json, useBigDecimalForDouble = true), parse(json))
+
+  private def preserveSignedZero(exact: JValue, standard: JValue): JValue = (exact, standard) match {
+    // BigDecimal has no signed zero; retain that one IEEE value from the standard parse.
+    case (JDecimal(value), legacy @ JDouble(number))
+      if value.signum == 0 && java.lang.Double.compare(number, -0.0d) == 0 => legacy
+    case (JObject(fields), JObject(originalFields)) =>
+      JObject(fields.zip(originalFields).map { case ((name, value), (_, original)) =>
+        name -> preserveSignedZero(value, original)
+      })
+    case (JArray(values), JArray(originalValues)) =>
+      JArray(values.zip(originalValues).map { case (value, original) => preserveSignedZero(value, original) })
+    case _ => exact
+  }
 }
 
 /** Default [[MLWriter]] implementation for transformers and estimators that contain basic
@@ -37,8 +57,8 @@ private[ml] class ComplexParamsWriter(instance: Params) extends MLWriter {
   override protected def saveImpl(path: String): Unit = {
     val complexParamLocs = ComplexParamsWriter.getComplexParamLocations(instance, path)
     val complexParamJson = ComplexParamsWriter.getComplexMetadata(complexParamLocs)
-    ComplexParamsWriter.saveMetadata(instance, path, sc, complexParamJson)
-    ComplexParamsWriter.saveComplexParams(path, complexParamLocs, shouldOverwrite)
+    ComplexParamsWriter.saveMetadata(instance, path, sparkSession, complexParamJson)
+    ComplexParamsWriter.saveComplexParams(path, complexParamLocs, shouldOverwrite, sparkSession)
   }
 }
 
@@ -55,7 +75,7 @@ private[ml] object ComplexParamsWriter {
   }
 
   def getComplexParamLocations(instance: Params, path: String): Map[ParamPair[_], Path] = {
-    val complexParams = instance.extractParamMap().toSeq.filter {
+    val complexParams = paramsToPersist(instance, instance.extractParamMap()).filter {
       case ParamPair(_: ComplexParam[_], _) => true
       case _ => false
     }
@@ -64,9 +84,24 @@ private[ml] object ComplexParamsWriter {
     }.toMap
   }
 
+  private def paramsToPersist(instance: Params, params: ParamMap): Seq[ParamPair[_]] = {
+    val implicitDefaults = instance match {
+      case writable: ComplexParamsWritable => writable.paramsWithImplicitDefaults
+      case _ => Set.empty[Param[_]]
+    }
+    // Preserve legacy saved defaults except those explicitly opted into constructor reconstruction.
+    params.toSeq
+      .filter(p => !implicitDefaults.contains(p.param) || instance.isSet(p.param))
+  }
+
+  /** Uses the active or default session. Writers with an assigned session must pass it explicitly. */
   def saveComplexParams(basePath: String, complexParamLocs: Map[ParamPair[_], Path],
                         shouldOverwrite: Boolean): Unit = {
-    val spark = SparkSession.builder().getOrCreate()
+    saveComplexParams(basePath, complexParamLocs, shouldOverwrite, SparkSession.builder().getOrCreate())
+  }
+
+  def saveComplexParams(basePath: String, complexParamLocs: Map[ParamPair[_], Path],
+                        shouldOverwrite: Boolean, spark: SparkSession): Unit = {
     complexParamLocs.foreach {
       case (ParamPair(p: ComplexParam[Any], v), loc) =>
         p.save(v, spark, new Path(basePath, loc), shouldOverwrite)
@@ -90,12 +125,12 @@ private[ml] object ComplexParamsWriter {
     */
   def saveMetadata(instance: Params,
                    path: String,
-                   sc: SparkContext,
+                   spark: SparkSession,
                    extraMetadata: Option[JObject] = None,
                    paramMap: Option[JValue] = None): Unit = {
     val metadataPath = new Path(path, "metadata").toString
-    val metadataJson = getMetadataToSave(instance, sc, extraMetadata, paramMap)
-    sc.parallelize(Seq(metadataJson), 1).saveAsTextFile(metadataPath)
+    val metadataJson = getMetadataToSave(instance, spark, extraMetadata, paramMap)
+    spark.createDataFrame(Seq(Tuple1(metadataJson))).toDF("value").write.text(metadataPath)
   }
 
   /** Helper for [[saveMetadata()]] which extracts the JSON to save.
@@ -104,24 +139,32 @@ private[ml] object ComplexParamsWriter {
     * @see [[saveMetadata()]] for details on what this includes.
     */
   def getMetadataToSave(instance: Params,
-                        sc: SparkContext,
+                        spark: SparkSession,
                         extraMetadata: Option[JObject] = None,
                         paramMap: Option[JValue] = None): String = {
+    getMetadataToSave(instance, spark, extraMetadata, paramMap, None)
+  }
+
+  def getMetadataToSave(instance: Params,
+                        spark: SparkSession,
+                        extraMetadata: Option[JObject],
+                        paramMap: Option[JValue],
+                        defaultParamMap: Option[JValue]): String = {
     val uid = instance.uid
     val cls = instance.getClass.getName
-    val params = instance.extractParamMap().toSeq
+    val params = paramsToPersist(instance, instance.extractParamMap())
       .filter(!_.param.isInstanceOf[ComplexParam[_]]).asInstanceOf[Seq[ParamPair[Any]]]
-    val defaultParams = instance.defaultParamMap.toSeq
+    val defaultParams = paramsToPersist(instance, instance.defaultParamMap)
       .filter(!_.param.isInstanceOf[ComplexParam[_]]).asInstanceOf[Seq[ParamPair[Any]]]
     val jsonParams = paramMap.getOrElse(render(params.map { case ParamPair(p, v) =>
-      p.name -> parse(p.jsonEncode(v))
+      p.name -> ComplexParamsJson.parseExact(p.jsonEncode(v))
     }.toList))
-    val jsonDefaultParams = render(defaultParams.map { case ParamPair(p, v) =>
-      p.name -> parse(p.jsonEncode(v))
-    }.toList)
+    val jsonDefaultParams = defaultParamMap.getOrElse(render(defaultParams.map { case ParamPair(p, v) =>
+      p.name -> ComplexParamsJson.parseExact(p.jsonEncode(v))
+    }.toList))
     val basicMetadata = ("class" -> cls) ~
       ("timestamp" -> System.currentTimeMillis()) ~
-      ("sparkVersion" -> sc.version) ~
+      ("sparkVersion" -> spark.version) ~
       ("uid" -> uid) ~
       ("paramMap" -> jsonParams) ~
       ("defaultParamMap" -> jsonDefaultParams)
@@ -147,20 +190,39 @@ private[ml] object ComplexParamsWriter {
 private[ml] class ComplexParamsReader[T] extends MLReader[T] {
 
   override def load(path: String): T = {
-    val metadata = DefaultParamsReader.loadMetadata(path, sc)
+    // Mirrors Spark 4.0's DefaultParamsReader.loadMetadata(path, spark, expectedClassName),
+    // which reads the metadata through the session rather than SparkContext.textFile. Spark 3.5
+    // only offers the SparkContext overload, so inline the same three lines here: otherwise
+    // loading a model still needs a SparkContext and remains unusable on Databricks Unity
+    // Catalog shared access mode and Spark Connect, which is the whole point of the writer
+    // change above.
+    val metadataPath = new Path(path, "metadata").toString
+    val metadataStr = sparkSession.read.text(metadataPath).first().getString(0)
+    // Spark's metadata parser narrows decimal JSON numbers to Double before param decoding.
+    val preciseMetadata = ComplexParamsJson.parseExact(metadataStr)
+    val metadata = DefaultParamsReader.parseMetadata(metadataStr).copy(
+      params = preciseMetadata \ "paramMap",
+      defaultParams = preciseMetadata \ "defaultParamMap",
+      metadata = preciseMetadata
+    )
     val cls = Utils.classForName(metadata.className)
     val instance =
       cls.getConstructor(classOf[String]).newInstance(metadata.uid).asInstanceOf[Params]
     metadata.getAndSetParams(instance)
-    ComplexParamsReader.getAndSetComplexParams(instance, metadata, path)
+    ComplexParamsReader.getAndSetComplexParams(instance, metadata, path, sparkSession)
     instance.asInstanceOf[T]
   }
 }
 
 private[ml] object ComplexParamsReader {
 
+  /** Uses the active or default session. Readers with an assigned session must pass it explicitly. */
   def getAndSetComplexParams(instance: Params, metadata: Metadata, basePath: String): Unit = {
-    val spark = SparkSession.builder().getOrCreate()
+    getAndSetComplexParams(instance, metadata, basePath, SparkSession.builder().getOrCreate())
+  }
+
+  def getAndSetComplexParams(instance: Params, metadata: Metadata,
+                             basePath: String, spark: SparkSession): Unit = {
     implicit val format: DefaultFormats.type = DefaultFormats
     val complexParamLocs = (metadata.metadata \ "complexParamLocs") match {
       case JNothing =>

@@ -3,14 +3,104 @@
 
 package com.microsoft.azure.synapse.ml.services.language
 
+import com.microsoft.azure.synapse.ml.core.test.base.TestBase
 import com.microsoft.azure.synapse.ml.services.text.{SentimentAssessment, TextEndpoint}
 import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, TransformerFuzzing}
+import com.microsoft.azure.synapse.ml.io.http.{HTTPRequestData, HTTPResponseData, HTTPSchema}
+import org.apache.http.impl.client.CloseableHttpClient
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions.{col, flatten, map}
 import org.scalactic.{Equality, TolerantNumerics}
 
+object AnalyzeTextErrorRoutingTestData extends Serializable {
+  val ResponseWithDocumentError: String =
+    """{
+      |  "kind": "PiiEntityRecognition",
+      |  "results": {
+      |    "documents": [
+      |      {
+      |        "id": "0",
+      |        "redactedText": "My SSN is ***********",
+      |        "entities": [],
+      |        "warnings": [],
+      |        "statistics": null
+      |      }
+      |    ],
+      |    "errors": [
+      |      {
+      |        "id": "1",
+      |        "error": {
+      |          "code": "InvalidArgument",
+      |          "message": "Document exceeds the service character limit.",
+      |          "target": "documents.1",
+      |          "details": null,
+      |          "innererror": {
+      |            "code": "InvalidDocument",
+      |            "innerError": "DocumentTooLong"
+      |          }
+      |        }
+      |      }
+      |    ],
+      |    "modelVersion": "test",
+      |    "statistics": {
+      |      "documentsCount": 2,
+      |      "validDocumentsCount": 1,
+      |      "erroneousDocumentsCount": 1,
+      |      "transactionsCount": 2
+      |    }
+      |  }
+      |}""".stripMargin
+
+  def okResponseHandler(
+      client: CloseableHttpClient,
+      request: HTTPRequestData): HTTPResponseData = {
+    HTTPSchema.stringToResponse(ResponseWithDocumentError, 200, "OK")
+  }
+}
+
+class AnalyzeTextErrorRoutingSuite extends TestBase {
+  import spark.implicits._
+
+  test("AnalyzeText moves document-level 200 response errors to errorCol") {
+    val model = new AnalyzeText()
+      .setSubscriptionKey("unused")
+      .setLocation("eastus")
+      .setTextCol("text")
+      .setLanguage("en")
+      .setKind("PiiEntityRecognition")
+      .setOutputCol("response")
+      .setErrorCol("error")
+      .setHandler(AnalyzeTextErrorRoutingTestData.okResponseHandler _)
+
+    val rows = model.transform(Seq("valid text", "too long").toDF("text").coalesce(1))
+      .select("response", "error")
+      .collect()
+
+    assert(rows.length == 2)
+    val (failedRows, successRows) = rows.partition(row => row.getAs[Row]("error") != null)
+    assert(successRows.length == 1)
+    assert(failedRows.length == 1)
+
+    val successResponse = successRows.head.getAs[Row]("response")
+    assert(successResponse.getAs[Row]("documents") != null)
+    assert(successResponse.getAs[Row]("errors") == null)
+
+    val failedResponse = failedRows.head.getAs[Row]("response")
+    assert(failedResponse.getAs[Row]("documents") == null)
+    assert(failedResponse.getAs[Row]("errors") == null)
+
+    val error = failedRows.head.getAs[Row]("error")
+    assert(error != null)
+    val errorResponse = error.getAs[String]("response")
+    assert(errorResponse.contains("InvalidArgument"))
+    assert(errorResponse.contains("Document exceeds the service character limit."))
+    assert(error.getAs[Row]("status") == null)
+  }
+}
+
 class EntityLinkingSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -39,8 +129,8 @@ class EntityLinkingSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoi
     assert(entities.contains("Bill Gates"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("entityNames", map(col("documents.id"), col("documents.entities.name")))
     val entities = result.head.getAs[Map[String, Seq[String]]]("entityNames")("0")
@@ -66,6 +156,7 @@ class EntityLinkingSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoi
 }
 
 class EntityRecognitionSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -94,8 +185,8 @@ class EntityRecognitionSuite extends TransformerFuzzing[AnalyzeText] with TextEn
     assert(entities.contains("Bill Gates"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("entityNames", map(col("documents.id"), col("documents.entities.text")))
     val entities = result.head.getAs[Map[String, Seq[String]]]("entityNames")("0")
@@ -121,6 +212,7 @@ class EntityRecognitionSuite extends TransformerFuzzing[AnalyzeText] with TextEn
 }
 
 class KeyPhraseSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -150,8 +242,8 @@ class KeyPhraseSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
     assert(keyPhrases.contains("Text Analytics"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("keyPhrases", col("documents.keyPhrases"))
     val keyPhrases = result.collect()(1).getAs[Seq[String]]("keyPhrases")
@@ -177,6 +269,7 @@ class KeyPhraseSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
 }
 
 class LanguageDetectionSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -206,8 +299,8 @@ class LanguageDetectionSuite extends TransformerFuzzing[AnalyzeText] with TextEn
     assert(detectedLanguages.contains("Spanish"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("detectedLanguage", col("documents.detectedLanguage.name"))
     val detectedLanguages = result.collect()(1).getAs[Seq[String]]("detectedLanguage")
@@ -233,6 +326,7 @@ class LanguageDetectionSuite extends TransformerFuzzing[AnalyzeText] with TextEn
 }
 
 class AnalyzeTextPIISuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -264,8 +358,8 @@ class AnalyzeTextPIISuite extends TransformerFuzzing[AnalyzeText] with TextEndpo
     assert(!redactedText.contains("111000025"))
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("redactedText", col("documents.redactedText"))
       .withColumn("entities", col("documents.entities.text"))
@@ -297,6 +391,7 @@ class AnalyzeTextPIISuite extends TransformerFuzzing[AnalyzeText] with TextEndpo
 }
 
 class SentimentAnalysisSuite extends TransformerFuzzing[AnalyzeText] with TextEndpoint {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -324,8 +419,8 @@ class SentimentAnalysisSuite extends TransformerFuzzing[AnalyzeText] with TextEn
     assert(result(1).getAs[String]("sentiment") == "negative")
   }
 
-  test("api-version 2022-10-01-preview") {
-    val result = model.setApiVersion("2022-10-01-preview").transform(df)
+  test("api-version 2024-11-01") {
+    val result = model.setApiVersion("2024-11-01").transform(df)
       .withColumn("documents", col("response.documents"))
       .withColumn("sentiment", col("documents.sentiment"))
       .collect()

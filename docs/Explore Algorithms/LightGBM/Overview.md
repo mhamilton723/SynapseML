@@ -8,7 +8,7 @@ sidebar_label: Overview
 
 ### LightGBM
 
-[LightGBM](https://github.com/Microsoft/LightGBM) is an open-source,
+[LightGBM](https://github.com/lightgbm-org/LightGBM) is an open-source,
 distributed, high-performance gradient boosting (GBDT, GBRT, GBM, or
 MART) framework. This framework specializes in creating high-quality and
 GPU enabled decision tree algorithms for ranking, classification, and
@@ -22,11 +22,11 @@ many other machine learning tasks. LightGBM is part of Microsoft's
     workloads.
 -   **Performance**: LightGBM on Spark is 10-30% faster than SparkML on
     the Higgs dataset, and achieves a 15% increase in AUC.  [Parallel
-    experiments](https://github.com/Microsoft/LightGBM/blob/master/docs/Experiments.rst#parallel-experiment)
+    experiments](https://github.com/lightgbm-org/LightGBM/blob/master/docs/Experiments.rst#parallel-experiment)
     have verified that LightGBM can achieve a linear speed-up by using
     multiple machines for training in specific settings.
 -   **Functionality**: LightGBM offers a wide array of [tunable
-    parameters](https://github.com/Microsoft/LightGBM/blob/master/docs/Parameters.rst),
+    parameters](https://github.com/lightgbm-org/LightGBM/blob/master/docs/Parameters.rst),
     that one can use to customize their decision tree system. LightGBM on
     Spark also supports new types of problems such as quantile regression.
 -   **Cross platform** LightGBM on Spark is available on Spark, PySpark, and SparklyR
@@ -56,6 +56,49 @@ model = LightGBMRegressor(application='quantile',
 
 For an end to end application, check out the LightGBM [notebook
 example](../Quickstart%20-%20Classification,%20Ranking,%20and%20Regression).
+
+#### Python classifier interoperability
+
+`LightGBMClassifier` and `LightGBMClassificationModel` implement PySpark's
+`HasRawPredictionCol` contract. The raw-prediction column defaults to
+`rawPrediction`; a custom `rawPredictionCol` is preserved through fitting,
+copying, and saving/loading the classifier or model.
+
+To train separate binary classifiers for a multiclass task, use PySpark's
+`OneVsRest` with the default raw-prediction column:
+
+```python
+from pyspark.ml.classification import OneVsRest
+from synapse.ml.lightgbm import LightGBMClassifier
+
+classifier = LightGBMClassifier(objective="binary")
+model = OneVsRest(classifier=classifier, parallelism=1).fit(train)
+predictions = model.transform(test)
+```
+
+`OneVsRest` fits one model per class. For LightGBM's native multiclass training,
+set `objective="multiclass"` or `objective="multiclassova"` on a single
+`LightGBMClassifier` instead.
+
+### Multiclass SHAP values
+
+For `objective="multiclass"` with more than two classes, `featuresShapCol` is one
+flat vector containing a block for each output class. Each block has one
+contribution per encoded feature followed by a bias value. Use the fitted
+model's `getBoosterNumClasses()` and `getBoosterNumFeatures()` to determine the
+shape; counting the original columns is insufficient after one-hot encoding.
+
+The [multiclass SHAP tutorial](./Multiclass%20SHAP%20values.md) demonstrates the
+layout, raw-score reconstruction, and per-class mean absolute contributions for
+numeric and one-hot encoded categorical features. These are explanations of
+model scores, not probabilities or causal effects.
+
+### Importing a Python-trained model
+
+The [Python model inputs guide](./Python%20model%20inputs.md) explains how to
+preserve feature order, categorical encodings and missing values when using
+`LightGBMBooster.score` / `predictLeaf` or an imported PySpark model. A new
+`StringIndexer` fit is not a substitute for the Python training mapping.
 
 ### Arguments/Parameters
 
@@ -102,15 +145,165 @@ You can mix *passThroughArgs* and explicit args, as shown in the example. Synaps
 merges them to create one argument string to send to LightGBM. If you set a parameter in
 both places, *passThroughArgs* takes precedence.
 
+#### Reproducible training
+
+`deterministic=True` applies to LightGBM after Spark has produced the training rows. For
+CPU training, LightGBM also recommends selecting one histogram strategy explicitly:
+
+```python
+model = LightGBMClassifier(
+    deterministic=True,
+    seed=777,
+    passThroughArgs="force_col_wise=true",
+).fit(train)
+```
+
+This does not make a nondeterministic Spark query deterministic. Operations such as
+`orderBy(rand())` without a seed can be evaluated again for each action, so a write and a
+later `fit()` may consume different row order or even a different sample. Materialize one
+training snapshot before comparing fits: write and reload it, or persist it and complete a
+materializing action before training. A Parquet reload can therefore expose an input-lineage
+difference without changing vector values, feature metadata, labels, weights, or initial
+scores. Compare the exact rows and metadata before interpreting a higher training AUC as a
+serialization defect; stable validation AUC can instead indicate training-set overfit.
+
+When `deterministic=True`, SynapseML logs a warning if Spark marks the training query as
+nondeterministic. For effective CPU training, it also warns if neither `force_col_wise=true`
+nor `force_row_wise=true` is enabled.
+
+#### Streaming feature vectors
+
+Every training and validation vector must have the same declared size, including
+sparse vectors with no stored entries. A sparse vector of size zero is not a
+valid replacement for an all-zero vector of the expected size. Streaming fits
+reject null vectors and dimension mismatches with an input error rather than
+filling missing columns from a reused micro-batch buffer. A supplied or reused
+`referenceDataset` must also have the same feature count.
+
+SynapseML checks training rows during its partition-count action and validation
+rows during validation transfer, before starting distributed native ingestion.
+Keep the input stable between Spark actions, for example by materializing a
+persisted snapshot. These checks do not provide recovery from executor loss or
+arbitrary failures after native training starts.
+
+Streaming ingestion allocates thread slots for partitions on each executor,
+including empty local partitions, rather than for every partition in the cluster.
+With `verbosity=2`, executor logs include the local partition IDs, row count, and
+external-thread count and `allocationBound` passed to native initialization. These ingestion threads
+are distinct from the native training threads controlled by `numThreads`.
+The fixed allocation bound uses at least 16 OpenMP slots and is raised to cover a
+positive `maxStreamingOMPThreads` hint, a positive `numThreads`, the process
+OpenMP team derived from `OMP_NUM_THREADS` or, on Linux, process CPU affinity,
+and positive `num_threads` values or aliases (`num_thread`, `nthread`,
+`nthreads`, or `n_jobs`) that SynapseML previously passed to LightGBM in the
+same executor JVM. If conflicting thread keys are supplied, SynapseML registers
+their maximum as a conservative allocation bound even when LightGBM selects a
+smaller value by its precedence rules. Native auto-sizing, logged as `allocationBound=-1`,
+is used only for one pushing thread when dataset initialization requests a nonpositive
+native thread count and OpenMP dynamic teams are disabled. A positive initialization count can
+narrow that thread's team before lazy upstream LightGBM prediction restores the process
+default; dynamic teams can also grow between pushes. Those cases retain the fixed bound.
+`OMP_DYNAMIC_ALL` is considered when `OMP_DYNAMIC` is absent. A value other than
+`true` or `false`, ignoring case and standard whitespace, warns and selects fixed
+allocation conservatively. This also covers runtime-specific true spellings.
+The whole `OMP_NUM_THREADS` list must be valid before its first value is used.
+If it is absent or invalid, a valid `OMP_NUM_THREADS_ALL` can raise the affinity
+or processor-count fallback, but cannot lower it because older runtimes ignore
+`_ALL`. Control characters other than standard whitespace are not trimmed into
+valid numbers. A valid unsuffixed value takes precedence over `_ALL`.
+When a fixed bound is needed and neither environment nor Linux-affinity source is available, SynapseML
+uses the best-effort maximum of the OS-reported and JVM-reported processor
+counts with the 16-thread floor. These detected counts are hints, not a proved
+upper bound on every native team. Linux process affinity can also differ from
+an OpenMP team's width after thread binding. A nonpositive hint does not disable
+the fixed safety bound, and the value is not a cap on the OpenMP team.
+Numeric thread-count settings parsed for allocation must fit in a signed 32-bit
+integer. Larger values fail explicitly instead of relying on native integer truncation.
+On Linux with the published native library's GNU OpenMP runtime, when
+`OMP_THREAD_LIMIT` is a positive decimal integer within the signed 32-bit range,
+it limits the fixed allocation width above the 16-slot floor. That runtime cannot form
+a team wider than this limit, even if a previous fit requested more threads.
+The registered history is retained, but it cannot force a larger allocation while
+this limit applies. Unsupported limit syntax, including a leading `+`, is not used
+as a ceiling and produces a warning. This conservative parsing avoids imposing a
+small allocation ceiling for a value another OpenMP runtime might ignore.
+On other platforms the ceiling is ignored with a warning. In particular, the
+published Windows library uses MSVC's OpenMP runtime, which does not enforce
+`OMP_THREAD_LIMIT`; macOS enforcement has not been validated here.
+Native code outside SynapseML and a concurrent fit that increases a pooled task
+thread's team after allocation remain outside this mitigation; clamping the
+native push index is the complete fix.
+
+Sparse bins can occur with dense or sparse input. Their total empty-vector header
+footprint is approximately `sparse bins × executor partitions × allocation width × 24 bytes`
+on a typical 64-bit platform, before allocator overhead and row payload. The additional
+header cost uses the increase in allocation width, not the total width. Debug logs from
+`LightGBMUtils` include the thread-count hints and registered history used for a fixed bound.
+Without a usable `OMP_THREAD_LIMIT`, large valid requests can still cause large
+allocations. SynapseML does not impose an arbitrary memory cap because a bound below
+the actual OpenMP team can reintroduce out-of-range writes.
+
+#### GPU training with a custom OpenCL native library
+
+SynapseML's published `lightgbmlib` artifact contains CPU-only native libraries. Only
+`deviceType="gpu"` selects an accelerator: it selects LightGBM's OpenCL learner and
+requires a compatible custom native library. All `cuda` requests are rejected before
+native training because LightGBM 3.3.510 CUDA is incompatible with SynapseML streaming
+Datasets.
+
+Accelerator training is intended for users who provide their own compatible LightGBM
+native build. Put both `lib_lightgbm` and `lib_lightgbm_swig` on `java.library.path` for
+the Spark driver and every executor before LightGBM is initialized. `NativeLoader` checks
+that path first and falls back to the CPU-only libraries packaged in the SynapseML JAR.
+For example, a Spark deployment can set both `spark.driver.extraLibraryPath` and
+`spark.executor.extraLibraryPath` to the directory containing the custom libraries.
+The custom SWIG library must be ABI-compatible with the Java classes shipped by the
+SynapseML version in use; supplying only one library can accidentally mix incompatible
+custom and bundled binaries.
+
+SynapseML does not support `deviceType="cuda"` with `lightgbmlib` 3.3.510. Its CUDA
+objective expects CUDA metadata that is not created by the serialized streaming Dataset
+path and can segfault the Spark executor during booster creation. SynapseML rejects CUDA
+before native training. Use `deviceType="gpu"` with an OpenCL-enabled native build; this
+path supports classifier, regressor, and ranker training on NVIDIA GPUs such as T4.
+
+`deviceType` exposes only the accelerator backends implemented by LightGBM:
+
+| Value | Backend | Hardware |
+| --- | --- | --- |
+| `cpu` | Native CPU learner | Supported by the bundled SynapseML native library |
+| `gpu` | OpenCL learner (`USE_GPU=1`) | AMD, Intel, or NVIDIA devices with a working OpenCL runtime |
+| `cuda` | Unsupported with SynapseML's LightGBM 3.3.510 streaming Dataset path | Do not use |
+
+Apple Metal Performance Shaders (`mps`) and Habana HPU are not LightGBM tree-learning
+backends and are therefore not accepted values. Apple Silicon can only be evaluated
+through LightGBM's OpenCL learner and a custom macOS ARM64 native build; this is not MPS
+support, Apple has deprecated OpenCL, and LightGBM documents a macOS Boost.Compute cache
+workaround. Do not claim Apple Silicon GPU support without testing that exact native build,
+Spark/JVM architecture, dataset correctness, and performance on supported macOS hardware.
+
+After installing the custom native libraries, select the learner explicitly:
+
+```python
+model = LightGBMClassifier(deviceType="gpu").fit(train)
+```
+
+The default is `cpu` and does not add a `device_type` native parameter. If
+*passThroughArgs* contains `device_type`, that canonical value takes precedence over both
+the `device` alias and `deviceType`, regardless of argument order. If only `device` is
+present, it takes precedence over `deviceType`. A native-effective value of `cuda` is
+always rejected. If a requested OpenCL accelerator is unavailable, SynapseML reports that
+the bundled native is CPU-only and identifies the custom-library configuration required.
+
 ### Architecture
 
 LightGBM on Spark uses the Simple Wrapper and Interface Generator (SWIG)
 to add Java support for LightGBM. These Java Binding use the Java Native
 Interface call into the [distributed C++
-API](https://github.com/Microsoft/LightGBM/blob/master/include/LightGBM/c_api.h).
+API](https://github.com/lightgbm-org/LightGBM/blob/master/include/LightGBM/c_api.h).
 
 We initialize LightGBM by calling
-[`LGBM_NetworkInit`](https://github.com/Microsoft/LightGBM/blob/master/include/LightGBM/c_api.h)
+[`LGBM_NetworkInit`](https://github.com/lightgbm-org/LightGBM/blob/master/include/LightGBM/c_api.h)
 with the Spark executors within a MapPartitions call. We then pass each
 workers partitions into LightGBM to create the in-memory distributed
 dataset for LightGBM.  We can then train LightGBM to produce a model
@@ -125,6 +318,20 @@ Models built can be saved as SparkML pipeline with native LightGBM model
 using `saveNativeModel()`. Additionally, they're fully compatible with [PMML](https://en.wikipedia.org/wiki/Predictive_Model_Markup_Language) and
 can be converted to PMML format through the
 [JPMML-SparkML-LightGBM](https://github.com/alipay/jpmml-sparkml-lightgbm) plugin.
+
+#### Classifier prediction iterations
+
+On `LightGBMClassifier`, `numIterations` controls training. A newly fitted
+`LightGBMClassificationModel` uses `numIterations=-1` to score every stored tree,
+including trees from continued or batched training. After early stopping, this
+includes the best iteration's tree. Direct predictions and SHAP values use the
+same default before and after `transform()`.
+
+To score fewer boosting iterations, call `model.setNumIterations(n)` before
+`model.transform(data)`. Spark model save/load preserves that setting; existing
+saved Spark models keep their stored limit. Native model export stores the trees,
+not the Spark prediction limit. Reapply any desired limit after
+`LightGBMClassificationModel.loadNativeModelFromString(...)`.
 
 #### Dynamic Allocation Limitations
 The native LightGBM library has a *distributed mode* that allows the algorithm to work over multiple *machines*. SynapseML
@@ -201,7 +408,7 @@ For streaming mode, only one Dataset is created per partition, so *useSingleData
 ### Data Sampling
 
 In order for LightGBM algorithm to work, it must first create a set of bin boundaries for optimization. It does this calculation by
-first sampling the data before any training or inferencing starts. ([LightGBM docs](https://github.com/Microsoft/LightGBM)). The number of
+first sampling the data before any training or inferencing starts. ([LightGBM docs](https://github.com/lightgbm-org/LightGBM)). The number of
 samples to use is set using *binSampleCount*, which must be a minimal percent of the data or LightGBM rejects it.
 
 For *bulk* mode, this sampling is automatically done over the entire data, and each executor uses its own partitions to calculate samples for only
@@ -260,3 +467,128 @@ To use it in scala, you can call setUseBarrierExecutionMode(true), for example:
     ...
     <train classifier>
 Note: barrier execution mode can also cause complicated issues, so use it only if needed.
+
+Barrier execution mode is also the only mode that can recover from a task failure that happens after the
+network topology has been negotiated. A LightGBM network is negotiated once and then fixed, so an individual
+Spark task retry can never rejoin it. Spark restarts a barrier stage in its entirety, and the driver serves a
+fresh topology round for each stage attempt, so training can survive a failure that would otherwise abort the
+job. Failures that happen before a task joins the network are still retried normally in either mode.
+
+### Diagnosing "Connection refused" during training
+
+Distributed training first exchanges `host:port` information with the driver, which serves that exchange
+once per stage attempt. If a task fails after that exchange, the regular (non-barrier) retry of that task
+reconnects to a driver endpoint that is no longer accepting connections. Because Spark only reports the
+most recent attempt, this can hide the failure that actually caused the retry.
+
+When this happens, the reported error explains that it's a retry that could not rejoin the network, and
+names the partition to investigate. Look for the **first** failed attempt of that partition in the executor
+logs — that attempt holds the real cause.
+
+#### Random-forest sampling configuration
+
+Setting `boostingType="rf"` or `"random_forest"` does not enable sampling automatically. If the first
+failed attempt reports LightGBM's random-forest sampling check, enable bagging with `baggingFreq > 0`
+and `0 < baggingFraction < 1`. For example, configure either learner before calling `fit`:
+
+```python
+from synapse.ml.lightgbm import LightGBMClassifier, LightGBMRegressor
+
+classifier = LightGBMClassifier(boostingType="rf", baggingFreq=1, baggingFraction=0.8)
+regressor = LightGBMRegressor(boostingType="rf", baggingFreq=1, baggingFraction=0.8)
+```
+
+The bundled native library also accepts feature sampling with `0 < featureFraction < 1` as an
+alternative. Custom or older native libraries may require bagging instead. These are example
+settings, not recommendations for model quality.
+
+The sampling guidance appears with the original booster failure. After non-barrier Spark task
+retries, the final driver-unreachable exception still points to the first failed attempt's executor
+logs; it does not repeat the sampling guidance. A connection error alone does not establish that
+sampling is the cause. Check the original error before changing training parameters.
+
+#### When numTasks is larger than the tasks Spark can run at once
+
+Without barrier execution mode, the driver waits for exactly *numTasks* training tasks to report, and they
+must all run at the same time. SynapseML repartitions the input when an explicit *numTasks* is larger than its
+partition count, but Spark can only run as many tasks at once as the cluster has task slots (each executor's
+cores divided by `spark.task.cpus`, summed across executors). If *numTasks* is larger than that, the tasks
+that started wait for tasks that can't start until they finish.
+
+After *timeout* seconds, the driver stops waiting and training fails with an error that lists how many tasks
+reported and which partitions are missing. Other tasks may then also report "could not reach the driver" or
+"Connection refused"; those errors are a result of the timeout. To fix it, lower *numTasks* to the number of
+task slots, or leave *numTasks* unset so SynapseML chooses it. Also check that no executor was lost or still
+starting when training began.
+
+To decide whether to repartition, SynapseML reads the input's partition count when *numTasks* is set. It
+already does this when *numTasks* is unset or barrier execution mode is on. If the input is an uncached
+DataFrame with a shuffle that hasn't run yet, such as a join or aggregation with adaptive query execution
+on, reading the count runs that shuffle one extra time. Training reads the input several times anyway, so
+if the input is expensive to compute, cache or persist it before calling `fit`.
+
+### IPv6 clusters
+
+Distributed training works on clusters whose executors only have IPv6 addresses.
+
+The native LightGBM library is IPv4-only in every released version: it splits each machine list entry on
+`:` and keeps the entry only when that yields exactly two parts, and it builds every socket with `AF_INET`
+and `inet_pton(AF_INET, ...)`. An IPv6 endpoint is therefore dropped or misread by the native parser, and
+could not be dialed or accepted even if it survived parsing.
+
+SynapseML handles this itself. The topology exchange publishes IPv6 endpoints in the unambiguous
+`[address]:port` form, and each task then bridges the transport for the native library:
+
+- the port a task advertised to its peers is owned by SynapseML, which accepts peer connections over
+  either address family and forwards them to the native listener over IPv4 loopback;
+- each IPv6 peer gets an IPv4 loopback relay that forwards what the native library sends to that peer's
+  real IPv6 address;
+- the machine list handed to the native library has the same entries in the same order, with every bridged
+  endpoint rewritten to `127.0.0.1:port` and an explicit rank, so LightGBM ranks are unchanged.
+
+An IPv4 machine list is passed to the native library exactly as before, with no relay and no rewriting, so
+IPv4 clusters see no behavior or performance change. On an IPv6 cluster, peer traffic takes one extra
+loopback hop on each side, and IPv4 loopback must be available on the executors. Measured on a 16 core
+developer machine over loopback, a bridged link sustains roughly a third of the throughput of a direct one
+(about 0.6 GB/s per direction) for about four times the CPU per transferred byte, and adds roughly 200
+microseconds to a small message round trip per hop. Links faster than a few Gb/s can therefore be limited
+by the bridge rather than by the network. The relays never buffer in the JVM heap: a reader that stops
+reading stops the sender, with only the socket buffers in between.
+
+The advertised port is the one address peers know, so SynapseML binds it on every interface, exactly as the
+native listener did before this change, and performs the LightGBM link handshake there itself. A machine
+opens a LightGBM link by sending its rank, so a connection has to produce a valid, unused, lower rank within
+a timeout before any of its bytes reach the native library; connections that stall, repeat a rank, or claim
+a rank the topology does not have are closed by the bridge. That matters because the native accept loop has
+no timeout and treats the first four bytes of any connection as a rank.
+
+The native listener itself is the one thing this library cannot rebind: `TcpSocket::Bind` hardcodes
+`0.0.0.0`, so while it is open it is reachable on every IPv4 interface. The bridge therefore claims each of
+that listener's link slots itself, over IPv4 loopback, as soon as the port is bound — one slot per lower
+rank, which is exactly how many the native library accepts before closing the listener. In practice the
+listener is open for milliseconds on an unadvertised ephemeral port rather than for the whole handshake
+phase, and every byte the native library reads from it comes from the bridge. Closing that window entirely
+requires an upstream change to LightGBM: `TcpSocket::Bind` would have to take a bind address so that
+`Linkers::TryBind` can pass a loopback one. Until then, a LightGBM training port must only be reachable
+from the cluster's own executors, which was already true before this change.
+
+The per peer relays are bound to IPv4 loopback and are not reachable from outside the machine, the number of
+links a bridge will relay is capped at twice the machine count, and each lower rank may link only once. One
+event loop thread serves every listener and every link, so a bridge runs exactly one thread whatever the
+machine count is, with two fixed size buffers per link.
+
+A connection the topology cannot need — an unsolicited one, one past the cap, or one that fails its
+handshake — is refused without consuming any of that budget, so it cannot starve the links the native
+library itself opens. Transport failures are retried while they can be: a dial that fails, immediately or
+later, backs off and retries until its deadline, and a failure while handling one connection never closes
+the listener that accepted it. A failure that cannot be retried away is recorded and fails the Spark task
+with that cause, both before and after the native initialization call, rather than leaving the task waiting
+on a transport that will not recover.
+
+Link-local addresses (`fe80::/10`) are supported only when a peer advertises a zone identifier
+(`fe80::1%eth0`) that names an interface on every other machine, since a link-local address is scoped to a
+single interface. A task normalizes a numeric scope (an interface index, which only means something on the
+machine that produced it) to the interface name before publishing its endpoint, and a peer that still
+advertises a numeric scope is rejected. A link-local peer without a zone, or with a zone this machine does
+not have, fails immediately with an error naming the address instead of hanging. Use a globally routable or
+unique-local IPv6 address for distributed training.

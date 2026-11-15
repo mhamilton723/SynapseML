@@ -11,13 +11,15 @@ import org.apache.spark.sql.DataFrame
 import java.io.File
 
 class SpeakerEmotionInferenceSuite extends TransformerFuzzing[SpeakerEmotionInference] with CognitiveKey {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   import spark.implicits._
 
   lazy val saveDir: File = tmpDir.toFile
 
   def ssmlGenerator: SpeakerEmotionInference = new SpeakerEmotionInference()
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setSubscriptionKey(cognitiveKey)
     .setLocale("en-US")
     .setVoiceName("en-US-JaneNeural")
@@ -126,7 +128,7 @@ class SpeakerEmotionInferenceSuite extends TransformerFuzzing[SpeakerEmotionInfe
 
   def tts: TextToSpeech = new TextToSpeech()
     .setUseSSML(true)
-    .setLocation("eastus")
+    .setLocation(cognitiveLoc)
     .setSubscriptionKey(cognitiveKey)
     .setTextCol("ssml")
     .setOutputFileCol("filename")

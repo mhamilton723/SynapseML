@@ -93,6 +93,7 @@ object RTestGen {
          |options(sparklyr.verbose = TRUE)
          |
          |conf <- spark_config()
+         |conf[["spark.synapseml.legacy.allowUnsafeJavaDeserialization"]] <- "true"
          |conf$$sparklyr.shell.conf <- c(
          |  "spark.app.name=SparklyRTests",
          |  "spark.jars.packages=$SparkMavenPackageList",
@@ -101,7 +102,7 @@ object RTestGen {
          |  "spark.sql.shuffle.partitions=10",
          |  "spark.sql.crossJoin.enabled=true")
          |
-         |sc <- spark_connect(master = "local", version = "3.4.1", config = conf)
+         |sc <- spark_connect(master = "local", version = "3.5.0", config = conf)
          |
          |""".stripMargin, StandardOpenOption.CREATE)
 

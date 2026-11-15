@@ -7,7 +7,28 @@ import scala.xml.transform.{RewriteRule, RuleTransformer}
 import scala.xml.{Node => XmlNode, NodeSeq => XmlNodeSeq, _}
 
 val condaEnvName = "synapseml"
-val sparkVersion = "3.4.1"
+// When a specific tag is checked out, use that tag as the version instead of dynver.
+// This avoids ambiguity when multiple tags point to the same commit, since dynver uses
+// git-describe which picks arbitrarily among tags on the same commit.
+// Priority: BUILD_SOURCEBRANCH env var (ADO CI) > git reflog (local checkout) > dynver
+ThisBuild / version := {
+  import scala.sys.process._
+  sys.env.get("BUILD_SOURCEBRANCH")
+    .filter(_.startsWith("refs/tags/v"))
+    .map(_.stripPrefix("refs/tags/v"))
+    .orElse {
+      scala.util.Try(Seq("git", "reflog", "-1", "--format=%gs").!!.trim)
+        .toOption
+        .filter(_.startsWith("checkout: moving from "))
+        .flatMap("checkout: moving from .* to (v[0-9].*)".r.findFirstMatchIn(_))
+        .map(_.group(1).stripPrefix("v"))
+        .filter(v => scala.util.Try(Seq("git", "tag", "-l", s"v$v").!!.trim).toOption.exists(_.nonEmpty))
+    }
+    .getOrElse((ThisBuild / version).value)
+}
+
+
+val sparkVersion = "3.5.0"
 name := "synapseml"
 ThisBuild / organization := "com.microsoft.azure"
 ThisBuild / scalaVersion := "2.12.17"
@@ -16,7 +37,8 @@ val scalaMajorVersion = 2.12
 
 val excludes = Seq(
   ExclusionRule("org.apache.spark", s"spark-tags_$scalaMajorVersion"),
-  ExclusionRule("org.scalatest")
+  ExclusionRule("org.scalatest"),
+  ExclusionRule("org.scalanlp", s"breeze_$scalaMajorVersion")
 )
 
 val coreDependencies = Seq(
@@ -34,13 +56,10 @@ val extraDependencies = Seq(
   "com.jcraft" % "jsch" % "0.1.54",
   "org.apache.httpcomponents.client5" % "httpclient5" % "5.1.3",
   "org.apache.httpcomponents" % "httpmime" % "4.5.13",
-  "com.linkedin.isolation-forest" %% "isolation-forest_3.4.2" % "3.0.4"
+  "com.linkedin.isolation-forest" %% "isolation-forest_3.5.0" % "3.0.5"
     exclude("com.google.protobuf", "protobuf-java") exclude("org.apache.spark", "spark-mllib_2.12")
     exclude("org.apache.spark", "spark-core_2.12") exclude("org.apache.spark", "spark-avro_2.12")
     exclude("org.apache.spark", "spark-sql_2.12"),
-  // Although breeze 2.1.0 is already provided by Spark, this is needed for Azure Synapse Spark 3.4 pools.
-  // Otherwise a NoSuchMethodError will be thrown by interpretability code.
-  "org.scalanlp" %% "breeze" % "2.1.0"
 ).map(d => d excludeAll (excludes: _*))
 val dependencies = coreDependencies ++ extraDependencies
 
@@ -132,6 +151,10 @@ generatePythonDoc := {
 
 
 val packageSynapseML = TaskKey[Unit]("packageSynapseML", "package all projects into SynapseML")
+val cleanMergedPython = TaskKey[Unit]("cleanMergedPython", "clean merged Python package sources")
+cleanMergedPython := {
+  FileUtils.deleteDirectory(join(rootGenDir.value, "src", "python"))
+}
 packageSynapseML := {
   def writeSetupFileToTarget(dir: File): Unit = {
     if (!dir.exists()) {
@@ -154,7 +177,7 @@ packageSynapseML := {
          |    long_description="SynapseML contains Microsoft's open source "
          |                     + "contributions to the Apache Spark ecosystem",
          |    license="MIT",
-         |    packages=find_namespace_packages(include=['synapse.ml.*']),
+         |    packages=find_namespace_packages(include=['synapse.ml', 'synapse.ml.*']),
          |    url="https://github.com/Microsoft/SynapseML",
          |    author="Microsoft",
          |    author_email="synapseml-support@microsoft.com",
@@ -168,7 +191,10 @@ packageSynapseML := {
          |        "Programming Language :: Python :: 3",
          |    ],
          |    zip_safe=True,
-         |    package_data={"synapseml": ["../LICENSE.txt", "../README.txt"]},
+         |    package_data={
+         |        "": ["*.pyi", "py.typed"],
+         |        "synapseml": ["../LICENSE.txt", "../README.txt"],
+         |    },
          |)
          |
          |""".stripMargin
@@ -176,6 +202,7 @@ packageSynapseML := {
   }
 
   Def.sequential(
+    cleanMergedPython,
     runTaskForAllInCompile(packagePython),
     runTaskForAllInCompile(mergePyCode)
   ).value
@@ -262,9 +289,37 @@ val settings = Seq(
   assembly / assemblyOption := (assembly / assemblyOption).value.copy(includeScala = false),
   autoAPIMappings := true,
   pomPostProcess := pomPostFunc,
-  sbtPlugin := false
+  sbtPlugin := false,
+  // Scoverage: exclude only code that genuinely cannot be exercised by unit tests --
+  // the build-time generator entry points and the classes that require a live
+  // Microsoft Fabric environment (token brokering / workload endpoints).
+  // Deliberately NOT excluded: CodegenConfig, DefaultParamInfo, GenerationUtils and
+  // Wrappable are pure logic with existing unit tests, and fabric's FabricTokenParser,
+  // OpenAIFabricSetting and RESTUtils have no live-environment dependency.
+  // Kept inline (rather than a top-level val) so this diff stays a single hunk anchored
+  // on a stable line, which lets it cherry-pick cleanly onto the release branches.
+  coverageExcludedPackages := Seq(
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.codegen\\.CodeGen.*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.codegen\\.PyCodegen.*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.codegen\\.RCodegen.*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.codegen\\.PythonInitMerger.*",
+    // sbt-buildinfo generates BuildInfo into src_managed. It is emitted code with no
+    // branches, it is instrumented at 28 lines / 0% by scoverage, and there is nothing
+    // meaningful to unit test, so measuring it only depresses the reported number.
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.build\\..*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.fabric\\.FabricClient.*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.fabric\\.TokenLibrary.*",
+    "com\\.microsoft\\.azure\\.synapse\\.ml\\.logging\\.fabric\\..*"
+  ).mkString(";"),
+  coverageFailOnMinimum := false,
+  coverageHighlighting := true,
+  // Cobertura XML is the format the Azure DevOps coverage publisher consumes.
+  coverageOutputCobertura := true
 )
 ThisBuild / publishMavenStyle := true
+// repo1.maven.org intermittently rate-limits hosted CI agents. Keep Maven
+// Central's canonical endpoint as the next Ivy resolver for the same artifacts.
+ThisBuild / resolvers += "Maven Central fallback" at "https://repo.maven.apache.org/maven2"
 
 lazy val core = (project in file("core"))
   .enablePlugins(BuildInfoPlugin)
@@ -286,10 +341,18 @@ lazy val deepLearning = (project in file("deep-learning"))
   .settings(settings ++ Seq(
     libraryDependencies ++= Seq(
       "com.microsoft.azure" % "onnx-protobuf_2.12" % "0.9.3",
-      "com.microsoft.onnxruntime" % "onnxruntime_gpu" % "1.8.1"
+      // Default to the CPU-only, cross-platform ONNX Runtime artifact (ships native libraries for
+      // Windows x64, Linux x64/aarch64, and macOS x64/aarch64) so ONNXModel works out of the box on
+      // every supported platform. CUDA support is an explicit opt-in: the onnxruntime_gpu artifact
+      // adds NVIDIA CUDA/TensorRT execution providers (Linux/Windows only, ~300+MB) and is never
+      // bundled by default. See docs/Explore Algorithms/Deep Learning/ONNX.md for GPU setup.
+      "com.microsoft.onnxruntime" % "onnxruntime" % "1.8.1",
+      "org.apache.hadoop" % "hadoop-common" % "3.3.4" % "test",
+      "org.apache.hadoop" % "hadoop-azure" % "3.3.4" % "test",
     ),
     name := "synapseml-deep-learning"
   ): _*)
+  .settings(OnnxRuntimeDependency.settings: _*)
 
 lazy val lightgbm = (project in file("lightgbm"))
   .dependsOn(core % "test->test;compile->compile")
@@ -362,6 +425,6 @@ val testWebsiteDocs = TaskKey[Unit]("testWebsiteDocs",
   "test code blocks inside markdowns under folder website/docs/documentation")
 testWebsiteDocs := {
   runCmd(
-    Seq("python", s"${join(baseDirectory.value, "website/doctest.py")}", version.value)
+    activateCondaEnv ++ Seq("python", s"${join(baseDirectory.value, "website/doctest.py")}", version.value)
   )
 }

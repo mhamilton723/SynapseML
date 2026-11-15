@@ -11,7 +11,26 @@ import org.slf4j.Logger
 import java.io._
 import scala.annotation.tailrec
 
-private object TrainUtils extends Serializable {
+private[lightgbm] object TrainUtils extends Serializable {
+
+  private val HigherIsBetterMetricPrefixes = Seq("auc", "ndcg@", "map@", "average_precision")
+
+  private[lightgbm] def isImprovement(evalName: String,
+                                      evalScore: Double,
+                                      bestScore: Double,
+                                      improvementTolerance: Double): Boolean = {
+    if (HigherIsBetterMetricPrefixes.exists(evalName.startsWith)) {
+      evalScore - bestScore > improvementTolerance
+    } else {
+      bestScore - evalScore > improvementTolerance
+    }
+  }
+
+  private[lightgbm] def shouldStopEarly(iteration: Int,
+                                        bestIteration: Int,
+                                        earlyStoppingRound: Int): Boolean = {
+    earlyStoppingRound > 0 && iteration - bestIteration >= earlyStoppingRound
+  }
 
   def createBooster(trainParams: BaseTrainParams,
                     trainDataset: LightGBMDataset,
@@ -88,10 +107,8 @@ private object TrainUtils extends Serializable {
       }
     } catch {
       case e: java.lang.Exception =>
-        log.warn("LightGBM reached early termination on one task," +
-          " stopping training on task. This message should rarely occur." +
-          " Inner exception: " + e.toString)
-        state.isFinished = true
+        log.error(s"LightGBM task failed during iteration ${state.iteration}", e)
+        throw e
     }
   }
 
@@ -144,20 +161,14 @@ private object TrainUtils extends Serializable {
     val evalResults: Array[(String, Double)] = state.booster.getEvalResults(state.evalNames, 1)
     val results: Array[(String, Double)] = evalResults.zipWithIndex.map { case ((evalName, evalScore), index) =>
       log.info(s"Valid $evalName=$evalScore")
-      val cmp =
-        if (evalName.startsWith("auc")
-            || evalName.startsWith("ndcg@")
-            || evalName.startsWith("map@")
-            || evalName.startsWith("average_precision"))
-          (x: Double, y: Double, tol: Double) => x - y > tol
-        else
-          (x: Double, y: Double, tol: Double) => x - y < tol
       if (state.bestScores(index) == null
-          || cmp(evalScore, state.bestScore(index), state.ctx.trainingCtx.improvementTolerance)) {
+          || isImprovement(evalName, evalScore, state.bestScore(index),
+            state.ctx.trainingCtx.improvementTolerance)) {
         state.bestScore(index) = evalScore
         state.bestIteration(index) = state.iteration
         state.bestScores(index) = evalResults.map(_._2)
-      } else if (state.iteration - state.bestIteration(index) >= state.ctx.trainingCtx.earlyStoppingRound) {
+      } else if (shouldStopEarly(state.iteration, state.bestIteration(index),
+        state.ctx.trainingCtx.earlyStoppingRound)) {
         state.isFinished = true
         log.info("Early stopping, best iteration is " + state.bestIteration(index))
         state.bestIterationResult = Some(state.bestIteration(index))

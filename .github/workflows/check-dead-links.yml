@@ -15,12 +15,50 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install dependencies
+      - name: Fetch sitemap URLs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget
+          set -euo pipefail
+
+          SITEMAP_URL="https://microsoft.github.io/SynapseML/sitemap.xml"
+
+          # Download sitemap to a file with retries and error reporting
+          HTTP_CODE=$(curl --silent --show-error --compressed \
+            --retry 3 --retry-delay 5 \
+            -o sitemap.xml -w '%{http_code}' \
+            "$SITEMAP_URL")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Failed to fetch sitemap from $SITEMAP_URL (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          SITEMAP_SIZE=$(wc -c < sitemap.xml)
+          echo "Downloaded sitemap: $SITEMAP_SIZE bytes"
+
+          # Extract URLs using POSIX extended regex (portable, no PCRE dependency)
+          grep -oE '<loc>[^<]+</loc>' sitemap.xml \
+            | sed 's/<\/*loc>//g' \
+            > urls.txt
+
+          URL_COUNT=$(wc -l < urls.txt)
+          echo "Found $URL_COUNT URLs in sitemap"
+
+          if [ "$URL_COUNT" -eq 0 ]; then
+            echo "::error::Sitemap at $SITEMAP_URL contained no URLs (file was $SITEMAP_SIZE bytes)"
+            head -c 500 sitemap.xml
+            exit 1
+          fi
+
       - name: Scan for dead links
-        run: |
-          wget --spider --recursive --no-verbose --tries=3 --retry-connrefused --no-clobber --directory-prefix=site-check https://microsoft.github.io/SynapseML/
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: >-
+            --no-progress
+            --max-concurrency 8
+            --max-retries 5
+            --retry-wait-time 5
+            --timeout 30
+            --accept 100..=103,200..=299,503
+            urls.txt

@@ -143,6 +143,23 @@ trait LightGBMExecutionParams extends Wrappable {
   def getMatrixType: String = $(matrixType)
   def setMatrixType(value: String): this.type = set(matrixType, value)
 
+  val deviceType = new Param[String](this, "deviceType",
+    "Device for tree learning: cpu or gpu (OpenCL). Default is cpu. SynapseML's bundled native LightGBM library " +
+      "is CPU-only; gpu requires compatible custom native libraries on java.library.path for every driver and " +
+      "executor. The LightGBM 3.3.510 CUDA backend is incompatible with SynapseML streaming Datasets.",
+    ParamValidators.inArray(Array(LightGBMConstants.CPUDeviceType,
+                                  LightGBMConstants.GPUDeviceType)))
+  setDefault(deviceType -> LightGBMConstants.CPUDeviceType)
+  def getDeviceType: String = $(deviceType)
+  def setDeviceType(value: String): this.type = {
+    if (value == LightGBMConstants.CUDADeviceType) {
+      throw new IllegalArgumentException(
+        "deviceType=cuda is not supported by SynapseML's LightGBM 3.3.510 integration because it can crash " +
+          "Spark executors. Use deviceType=gpu with an OpenCL-enabled custom native library.")
+    }
+    set(deviceType, value)
+  }
+
   val numThreads = new IntParam(this, "numThreads",
     "Number of threads per executor for LightGBM. For the best speed, set this to the number of real CPU cores.")
   setDefault(numThreads -> 0)
@@ -151,8 +168,18 @@ trait LightGBMExecutionParams extends Wrappable {
 
   val maxStreamingOMPThreads = new IntParam(this,
     "maxStreamingOMPThreads",
-    "Maximum number of OpenMP threads used by a LightGBM thread. Used only for thread-safe buffer allocation." +
-      " Use -1 to use OpenMP default, but in a Spark environment it's best to set a fixed value.")
+    "Streaming OpenMP allocation hint per Spark task thread. Used only for thread-safe buffer allocation." +
+      " SynapseML raises this value as needed to cover numThreads, the process OpenMP team from" +
+      " OMP_NUM_THREADS, OMP_NUM_THREADS_ALL or Linux CPU affinity, and positive num_threads values or aliases" +
+      " previously passed to LightGBM in the executor JVM. Conflicting thread keys are registered at their maximum" +
+      " as a conservative allocation bound. Fixed bounds always have a 16-slot floor; a positive decimal" +
+      " OMP_THREAD_LIMIT within signed 32-bit range bounds requests above that floor only on Linux." +
+      " Other platforms ignore this ceiling because runtime enforcement is not established. A single pushing" +
+      " thread uses native auto-sizing only for a nonpositive effective native thread count with" +
+      " OMP_DYNAMIC disabled. OMP_DYNAMIC_ALL is considered when OMP_DYNAMIC is absent; unrecognized" +
+      " dynamic settings retain fixed allocation. Without a team source, best-effort OS/JVM processor counts" +
+      " are used; on non-Linux hosts this is not a proved native-team bound. Nonpositive values do not disable" +
+      " the fixed safety bound or cap the OpenMP team.")
   setDefault(maxStreamingOMPThreads -> 16)
   def getMaxStreamingOMPThreads: Int = $(maxStreamingOMPThreads)
   def setMaxStreamingOMPThreads(value: Int): this.type = set(maxStreamingOMPThreads, value)
@@ -185,13 +212,18 @@ trait LightGBMDatasetParams extends Wrappable {
 /** Defines common parameters across all LightGBM learners related to learning score evolution.
   */
 trait LightGBMLearnerParams extends Wrappable {
-  val earlyStoppingRound = new IntParam(this, "earlyStoppingRound", "Early stopping round")
+  val earlyStoppingRound = new IntParam(this, "earlyStoppingRound",
+    "Number of rounds without sufficient improvement before stopping; zero disables early stopping",
+    ParamValidators.gtEq(0))
   setDefault(earlyStoppingRound -> 0)
   def getEarlyStoppingRound: Int = $(earlyStoppingRound)
   def setEarlyStoppingRound(value: Int): this.type = set(earlyStoppingRound, value)
 
-  val improvementTolerance = new DoubleParam(this, "improvementTolerance",
-    "Tolerance to consider improvement in metric")
+  val improvementTolerance = new DoubleParam(
+    this,
+    "improvementTolerance",
+    "Metric improvement must exceed this value to reset the early stopping counter",
+    ParamValidators.gtEq(0.0))
   setDefault(improvementTolerance -> 0.0)
   def getImprovementTolerance: Double = $(improvementTolerance)
   def setImprovementTolerance(value: Double): this.type = set(improvementTolerance, value)
@@ -321,7 +353,7 @@ trait LightGBMFractionParams extends Wrappable {
   def setFeatureFraction(value: Double): this.type = set(featureFraction, value)
 
   val featureFractionByNode = new DoubleParam(this, "featureFractionByNode", "Feature fraction by node")
-  setDefault(featureFraction->1)
+  setDefault(featureFractionByNode->1)
   def getFeatureFractionByNode: Double = $(featureFractionByNode)
   def setFeatureFractionByNode(value: Double): this.type = set(featureFractionByNode, value)
 }
@@ -402,7 +434,7 @@ trait LightGBMSeedParams extends Wrappable {
   def setSeed(value: Int): this.type = set(seed, value)
 
   val deterministic = new BooleanParam(this, "deterministic", "Used only with cpu " +
-    "devide type. Setting this to true should ensure stable results when using the same data and the " +
+    "device type. Setting this to true should ensure stable results when using the same data and the " +
     "same parameters.  Note: setting this to true may slow down training.  To avoid potential instability " +
     "due to numerical issues, please set force_col_wise=true or force_row_wise=true when setting " +
     "deterministic=true")
@@ -569,7 +601,7 @@ trait LightGBMParams extends Wrappable
   def setLambdaL2(value: Double): this.type = set(lambdaL2, value)
 
   val isProvideTrainingMetric = new BooleanParam(this, "isProvideTrainingMetric",
-    "Whether output metric result over training dataset.")
+    "Whether to output metric results over the training dataset.")
   setDefault(isProvideTrainingMetric -> false)
   def getIsProvideTrainingMetric: Boolean = $(isProvideTrainingMetric)
   def setIsProvideTrainingMetric(value: Boolean): this.type = set(isProvideTrainingMetric, value)

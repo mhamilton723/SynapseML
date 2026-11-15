@@ -8,6 +8,7 @@ import com.microsoft.azure.synapse.ml.services._
 import com.microsoft.azure.synapse.ml.core.env.StreamUtilities
 import com.microsoft.azure.synapse.ml.core.test.base.TestBase
 import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, TransformerFuzzing}
+import com.microsoft.cognitiveservices.speech.PropertyId
 import org.apache.commons.compress.utils.IOUtils
 import org.apache.commons.io.FileUtils
 import org.apache.spark.ml.util.MLReadable
@@ -19,16 +20,12 @@ import org.scalatest.Assertion
 import java.io.{ByteArrayInputStream, File, FileInputStream}
 import java.net.URI
 
-trait CustomSpeechKey {
-  lazy val customSpeechKey = sys.env.getOrElse("CUSTOM_SPEECH_API_KEY", Secrets.CustomSpeechApiKey)
-}
-
 //scalastyle:off null
-trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey with CustomSpeechKey {
+trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey {
 
   import spark.implicits._
 
-  val region = "eastus"
+  val region = cognitiveLoc
   lazy val resourcesDir = new File(getClass.getResource("/").toURI)
   val uri = new URI(s"https://$region.api.cognitive.microsoft.com/sts/v1.0/issuetoken")
   val language = "en-us"
@@ -36,8 +33,6 @@ trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey with CustomSpe
   val wordLevelTimestamps = false
   val format = "simple"
 
-
-  val streamUrl = "http://qthttp.apple.com.edgesuite.net/1010qwoeiuryfg/sl.m3u8"
 
   val jaccardThreshold = 0.9
 
@@ -137,6 +132,7 @@ trait SpeechToTextSDKSuiteBase extends TestBase with CognitiveKey with CustomSpe
 }
 
 class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with SpeechToTextSDKSuiteBase {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -149,10 +145,6 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
     .setAudioDataCol("audio")
     .setLanguage("en-US")
     .setProfanity("Masked")
-
-  def customSdk: SpeechToTextSDK = sdk
-    .setSubscriptionKey(customSpeechKey)
-    .setEndpointId("395cdcf7-e7db-4083-aebe-868a7d80ca74")
 
   override lazy val dfEq = new Equality[DataFrame] {
     override def areEqual(a: DataFrame, b: Any): Boolean = {
@@ -209,8 +201,16 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
     dfTest("simple", audioDf1, text1, sdk = sdk.setStreamIntermediateResults(false))
   }
 
-  test("Custom SDK Usage") {
-    dfTest("simple", audioDf1, text1, sdk = customSdk)
+  test("Custom endpoint ID is applied to the Speech SDK config") {
+    val endpointId = "00000000-0000-0000-0000-000000000001"
+    val config = new SpeechToTextSDK()
+      .setEndpointId(endpointId)
+      .getSpeechConfig(uri, "test-key", language, profanity, wordLevelTimestamps, format)
+    try {
+      assert(config.getProperty(PropertyId.SpeechServiceConnection_EndpointId) === endpointId)
+    } finally {
+      config.close()
+    }
   }
 
   test("Detailed SDK Usage Audio 2") {
@@ -232,9 +232,7 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
   }
 
   ignore("SAS URL based access") {
-    val sasURL = "https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav" +
-      "?sp=r&st=2024-03-18T20:17:56Z&se=9999-03-19T04:17:56Z&spr=https&sv=2022-11-02" +
-      "&sr=b&sig=JUU1ojKzTbb45bSP7rOAVXajwrUEp9Ux20oCiD8%2Bb%2FM%3D"
+    val sasURL = "https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav"
 
     tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
       val uriDf = Seq(Tuple1(sasURL))
@@ -247,16 +245,41 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
     dfTest("detailed", audioDf3, text3, sdk = sdk.setFileType("mp3"), verbose = true, threshold = .6)
   }
 
+  test("ffmpeg decodes the local HLS fixture into nonempty audio") {
+    FileUtils.forceMkdir(tmpDir.toFile)
+    SpeechHlsFixture.withStream { uri =>
+      val output = new File(tmpDir.toFile, "hls.mp3")
+      SpeechHlsFixture.runFfmpeg(SpeechSDKBase.makeFfmpegCommand(uri, Seq("-t", "60")), output)
+      assert(output.length() > 0)
+
+      val decoded = new File(tmpDir.toFile, "hls.pcm")
+      SpeechHlsFixture.runFfmpeg(Seq("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", output.toString, "-f", "s16le", "-ac", "1", "-ar", "16000", "pipe:1"), decoded)
+      assert(decoded.length() > audioPaths(1).length() * 0.9)
+      assert(decoded.length() < audioPaths(1).length() * 1.1)
+    }
+  }
+
+  test("recording assertions reject ffmpeg output from an unavailable HLS playlist") {
+    FileUtils.forceMkdir(tmpDir.toFile)
+    SpeechHlsFixture.withStream { uri =>
+      val output = new File(tmpDir.toFile, "missing.mp3")
+      intercept[IllegalArgumentException] {
+        SpeechHlsFixture.runFfmpeg(
+          SpeechSDKBase.makeFfmpegCommand(uri.replace("audio.m3u8", "missing.m3u8"), Seq("-t", "1")), output)
+      }
+      assert(output.exists())
+      assert(output.length() == 0)
+    }
+  }
+
   test("m3u8 based access") {
     val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "60"))
       .setLanguage("en-US")
-    // 20 seconds of streaming
-    tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
+    SpeechHlsFixture.withStream { streamUrl =>
       val uriDf = Seq(Tuple1(streamUrl))
         .toDF("audio")
-      dfTest(
-        "detailed",
-        uriDf, text4, verbose = true, sdk = sdk2, threshold = .6)
+      dfTest("detailed", uriDf, text2, sdk = sdk2)
     }
   }
 
@@ -265,21 +288,25 @@ class SpeechToTextSDKSuite extends TransformerFuzzing[SpeechToTextSDK] with Spee
     val outputJson = new File(savePath, "output.json")
 
     try {
-      val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "20"))
+      val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "60"))
         .setRecordedFileNameCol("recordedFile")
         .setRecordAudioData(true)
         .setLanguage("en-US")
 
-      // 20 seconds of streaming
-      val uriDf = Seq(Tuple2(streamUrl, outputMp3.toString))
-        .toDF("audio", "recordedFile")
-      sdk2.transform(uriDf).write.mode("overwrite").json(outputJson.toString)
+      SpeechHlsFixture.withStream { streamUrl =>
+        val uriDf = Seq(Tuple2(streamUrl, outputMp3.toString))
+          .toDF("audio", "recordedFile")
+        val result = sdk2.transform(uriDf)
+        result.write.mode("overwrite").json(outputJson.toString)
 
-      assert(outputMp3.exists())
-      assert(outputJson.exists())
+        assert(outputMp3.length() > 0)
+        val recorded = spark.read.schema(result.schema).json(outputJson.toString)
+        assert(jaccardSimilarity(text2,
+          speechArrayToText(extractResults(recorded, sdk2.getStreamIntermediateResults))) > jaccardThreshold)
+      }
     } finally {
-      FileUtils.forceDelete(outputMp3)
-      FileUtils.forceDelete(outputJson)
+      FileUtils.deleteQuietly(outputMp3)
+      FileUtils.deleteQuietly(outputJson)
     }
   }
 
@@ -320,6 +347,7 @@ trait TranscriptionSecrets {
 
 class ConversationTranscriptionSuite extends TransformerFuzzing[ConversationTranscription]
   with SpeechToTextSDKSuiteBase with TranscriptionSecrets {
+  override val compareDataInSerializationTest: Boolean = false
 
   override val retrySerializationFuzzing: Boolean = true
 
@@ -428,9 +456,7 @@ class ConversationTranscriptionSuite extends TransformerFuzzing[ConversationTran
   }
 
   ignore("SAS URL based access") {
-    val sasURL = "https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav" +
-      "?sp=r&st=2024-03-18T20:17:56Z&se=9999-03-19T04:17:56Z&spr=https&sv=2022-11-02" +
-      "&sr=b&sig=JUU1ojKzTbb45bSP7rOAVXajwrUEp9Ux20oCiD8%2Bb%2FM%3D"
+    val sasURL = "https://mmlspark.blob.core.windows.net/datasets/Speech/audio2.wav"
 
     tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
       val uriDf = Seq(Tuple1(sasURL))
@@ -446,13 +472,10 @@ class ConversationTranscriptionSuite extends TransformerFuzzing[ConversationTran
   test("m3u8 based access") {
     val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "60"))
       .setLanguage("en-US")
-    // 20 seconds of streaming
-    tryWithRetries(Array(100, 500)) { () => //For handling flaky build machines
+    SpeechHlsFixture.withStream { streamUrl =>
       val uriDf = Seq(Tuple1(streamUrl))
         .toDF("audio")
-      dfTest(
-        "simple",
-        uriDf, text4, sdk = sdk2, threshold = .6)
+      dfTest("simple", uriDf, text2, sdk = sdk2)
     }
   }
 
@@ -461,21 +484,25 @@ class ConversationTranscriptionSuite extends TransformerFuzzing[ConversationTran
     val outputJson = new File(savePath, "output.json")
 
     try {
-      val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "20"))
+      val sdk2 = sdk.setExtraFfmpegArgs(Array("-t", "60"))
         .setRecordedFileNameCol("recordedFile")
         .setRecordAudioData(true)
         .setLanguage("en-US")
 
-      // 20 seconds of streaming
-      val uriDf = Seq(Tuple2(streamUrl, outputMp3.toString))
-        .toDF("audio", "recordedFile")
-      sdk2.transform(uriDf).write.mode("overwrite").json(outputJson.toString)
+      SpeechHlsFixture.withStream { streamUrl =>
+        val uriDf = Seq(Tuple2(streamUrl, outputMp3.toString))
+          .toDF("audio", "recordedFile")
+        val result = sdk2.transform(uriDf)
+        result.write.mode("overwrite").json(outputJson.toString)
 
-      assert(outputMp3.exists())
-      assert(outputJson.exists())
+        assert(outputMp3.length() > 0)
+        val recorded = spark.read.schema(result.schema).json(outputJson.toString)
+        assert(jaccardSimilarity(text2,
+          speechArrayToText(extractResults(recorded, sdk2.getStreamIntermediateResults))) > jaccardThreshold)
+      }
     } finally {
-      FileUtils.forceDelete(outputMp3)
-      FileUtils.forceDelete(outputJson)
+      FileUtils.deleteQuietly(outputMp3)
+      FileUtils.deleteQuietly(outputJson)
     }
 
   }

@@ -1,12 +1,13 @@
-FROM mcr.microsoft.com/oss/mirror/docker.io/library/ubuntu:20.04
+FROM mcr.microsoft.com/mirror/docker/library/ubuntu:22.04@sha256:104ae83764a5119017b8e8d6218fa0832b09df65aae7d5a6de29a85d813da2fb
 
-ARG SYNAPSEML_VERSION=1.0.14
+ARG SYNAPSEML_VERSION=1.1.3
+ARG PYTHON_VERSION
 ARG DEBIAN_FRONTEND=noninteractive
 
-ENV SPARK_VERSION=3.4.1
+ENV SPARK_VERSION=3.5.4
 ENV HADOOP_VERSION=3
 ENV SYNAPSEML_VERSION=${SYNAPSEML_VERSION}
-ENV JAVA_HOME /usr/lib/jvm/java-1.11.0-openjdk-amd64
+ENV JAVA_HOME=/usr/lib/jvm/java-1.11.0-openjdk-amd64
 
 # Install required packages
 RUN apt-get -qq update \
@@ -22,15 +23,17 @@ RUN apt-get -qq update \
     && apt-get autoclean \
     && rm -rf /var/lib/apt/lists/* /var/log/dpkg.log
 
-# Install conda and required dependencies
-RUN curl -sSL https://repo.continuum.io/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh \
+# Install the shared conda bootstrap before image-specific packages.
+RUN curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh \
     && bash /tmp/miniconda.sh -bfp /usr/local \
     && rm -rf /tmp/miniconda.sh \
-    && conda update conda \
-    && conda install -y python=3 jupyter pyspark \
+    && conda config --set auto_activate_base false \
+    && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
+    && conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
+    && conda update -y conda \
     && conda clean --all --yes
 
-ENV PATH /opt/conda/bin:$PATH
+ENV PATH=/usr/local/bin:${PATH}
 
 # Download and install Spark
 RUN wget https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz \
@@ -38,9 +41,17 @@ RUN wget https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SP
     && mv spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION} /opt/spark \
     && rm spark-${SPARK_VERSION}-bin-hadoop${HADOOP_VERSION}.tgz
 
-ENV SPARK_HOME /opt/spark
-ENV PYTHONPATH $SPARK_HOME/python/:$SPARK_HOME/python/lib/py4j*:$PYTHON_PATH
-ENV PATH $SPARK_HOME/bin/:$SPARK_HOME/python/:$PATH
+# SYNAPSEML_BOOTSTRAP_END
+# Install image-specific Python dependencies.
+RUN test -n "${PYTHON_VERSION}" \
+      || (echo "PYTHON_VERSION build argument is required" >&2; exit 1) \
+    && conda install -y "python=${PYTHON_VERSION}" pyspark \
+    && pip install --no-cache-dir --upgrade "PyJWT>=2.12.0" \
+    && conda clean --all --yes
+
+ENV SPARK_HOME=/opt/spark
+ENV PYTHONPATH=${SPARK_HOME}/python/:${SPARK_HOME}/python/lib/py4j*
+ENV PATH=${SPARK_HOME}/bin/:${SPARK_HOME}/python/:${PATH}
 
 RUN apt-get remove --purge -y \
         curl \

@@ -1,0 +1,687 @@
+# Copyright (C) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License. See LICENSE in project root for information.
+
+import json
+import os
+import tempfile
+import unittest
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Queue
+from threading import Thread
+from unittest.mock import patch
+
+from py4j.protocol import Py4JError, Py4JJavaError
+from pyspark.errors.exceptions.captured import IllegalArgumentException
+from pyspark.ml import PipelineModel
+
+from synapse.ml.core.init_spark import init_spark
+from synapse.ml.services.openai.OpenAIEmbedding import OpenAIEmbedding
+from synapse.ml.services.openai.OpenAIPrompt import OpenAIPrompt
+from synapse.ml.services.text.TextSentiment import TextSentiment
+from synapse.ml.stages.SelectColumns import SelectColumns
+
+spark = init_spark()
+
+
+class TestServiceParamPythonBridge(unittest.TestCase):
+    def test_model_controls_reach_http_after_python_binding_and_prompt_reload(self):
+        from pyspark.sql import functions as F
+        from synapse.ml.services.openai.OpenAIChatCompletion import OpenAIChatCompletion
+        from synapse.ml.services.openai.OpenAIResponses import OpenAIResponses
+
+        requests = Queue()
+
+        @contextmanager
+        def isolated_requests():
+            try:
+                yield
+            finally:
+                for _ in range(requests.qsize()):
+                    requests.get_nowait()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                requests.put(body)
+                if "input" in body:
+                    response = {
+                        "id": "resp_cache",
+                        "status": "completed",
+                        "output": [],
+                        "prompt_cache_diagnostics": {"type": "cache_hit"},
+                        "usage": {
+                            "input_tokens": 12,
+                            "output_tokens": 0,
+                            "total_tokens": 12,
+                            "input_tokens_details": {
+                                "cached_tokens": 4,
+                                "cache_write_tokens": 7,
+                                "cache_write_tokens_details": {
+                                    "ttl_30m_tokens": 3,
+                                    "ttl_12h_tokens": 4,
+                                },
+                            },
+                        },
+                    }
+                else:
+                    response = {
+                        "id": "chat_cache",
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "ok"},
+                                "index": 0,
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 12,
+                            "completion_tokens": 1,
+                            "total_tokens": 13,
+                            "prompt_tokens_details": {
+                                "cached_tokens": 4,
+                                "cache_write_tokens": 7,
+                            },
+                        },
+                    }
+                encoded = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            frame = spark.createDataFrame(
+                [
+                    (
+                        "hello",
+                        "row-key",
+                        {"effort": "low", "summary": "auto"},
+                        4,
+                        {"job": "row"},
+                        False,
+                    )
+                ],
+                "text string, cache_key string, reasoning map<string,string>, "
+                "probability_count int, tags map<string,string>, persist boolean",
+            ).withColumn(
+                "messages",
+                F.array(
+                    F.struct(
+                        F.lit("user").alias("role"), F.col("text").alias("content")
+                    )
+                ),
+            )
+            cases = (
+                (OpenAIChatCompletion, "chat_completions"),
+                (OpenAIResponses, "responses"),
+                (OpenAIPrompt, "chat_completions"),
+                (OpenAIPrompt, "responses"),
+            )
+            for stage_type, api in cases:
+                with self.subTest(
+                    stage=stage_type.__name__, api=api
+                ), isolated_requests():
+                    options = {
+                        "promptCacheKey": "scalar-key",
+                        "promptCacheRetention": "24h",
+                        "promptCacheOptions": {"ttl": "12h", "mode": "implicit"},
+                        "serviceTier": "priority",
+                        "safetyIdentifier": "opaque-id",
+                        "metadata": {"job": "scalar"},
+                        "topLogProbs": 2,
+                        "store": True,
+                    }
+                    if api == "responses":
+                        options.update(
+                            reasoning={"context": "all_turns", "effort": "max"},
+                            include=["reasoning.encrypted_content"],
+                            truncation="disabled",
+                        )
+                        options["promptCacheOptions"]["prewarm"] = True
+                    else:
+                        options.update(
+                            logProbsEnabled=True,
+                            logitBias={"42": -10},
+                            stopSequences=["END", "STOP"],
+                        )
+                    stage = stage_type(**options)
+                    if api == "responses":
+                        stage.setParams(
+                            promptCacheKeyCol="cache_key",
+                            reasoningCol="reasoning",
+                            metadataCol="tags",
+                            topLogProbsCol="probability_count",
+                            storeCol="persist",
+                        )
+                    stage.setUrl(
+                        f"http://127.0.0.1:{server.server_port}/openai/v1/"
+                    ).setSubscriptionKey("unused")
+                    stage.setMessagesCol("messages").setOutputCol("output").setErrorCol(
+                        "error"
+                    )
+                    if stage_type is OpenAIPrompt:
+                        stage.setApiType(api).setPromptTemplate("{text}").setUsageCol(
+                            "usage"
+                        ).setResponseIdCol("response_id")
+                        with tempfile.TemporaryDirectory() as directory:
+                            path = os.path.join(directory, "prompt")
+                            stage.copy().save(path)
+                            stage = OpenAIPrompt.load(path)
+                    row = stage.transform(frame).head()
+                    body = requests.get(timeout=5)
+                    self.assertTrue(requests.empty(), "Unexpected extra HTTP requests")
+                    self.assertIsNone(row.error)
+                    self.assertEqual(body["prompt_cache_retention"], "24h")
+                    self.assertEqual(body["service_tier"], "priority")
+                    self.assertEqual(body["safety_identifier"], "opaque-id")
+                    self.assertEqual(
+                        body["top_logprobs"], 4 if api == "responses" else 2
+                    )
+                    self.assertIs(body["store"], api != "responses")
+                    self.assertEqual(
+                        body["prompt_cache_options"], options["promptCacheOptions"]
+                    )
+                    if api == "responses":
+                        self.assertEqual(body["prompt_cache_key"], "row-key")
+                        self.assertEqual(body["metadata"], {"job": "row"})
+                        self.assertEqual(
+                            body["reasoning"], {"effort": "low", "summary": "auto"}
+                        )
+                        self.assertEqual(body["truncation"], "disabled")
+                        self.assertEqual(
+                            body["include"],
+                            [
+                                "reasoning.encrypted_content",
+                                "message.output_text.logprobs",
+                            ],
+                        )
+                        self.assertNotIn("logprobs", body)
+                        if stage_type is OpenAIPrompt:
+                            self.assertIsNone(row.output)
+                        else:
+                            self.assertEqual(
+                                row.output.prompt_cache_diagnostics.type, "cache_hit"
+                            )
+                    else:
+                        self.assertEqual(body["prompt_cache_key"], "scalar-key")
+                        self.assertEqual(body["metadata"], {"job": "scalar"})
+                        self.assertIs(body["logprobs"], True)
+                        self.assertEqual(body["logit_bias"], {"42": -10})
+                        self.assertEqual(body["stop"], ["END", "STOP"])
+                    if stage_type is OpenAIPrompt:
+                        self.assertEqual(
+                            row.usage.input_token_details["cached_tokens"], 4
+                        )
+                        self.assertEqual(
+                            row.usage.input_token_details["cache_write_tokens"], 7
+                        )
+                        if api == "responses":
+                            self.assertIsNone(row.response_id)
+                        else:
+                            self.assertTrue(row.response_id.endswith("_cache"))
+            self.assertTrue(requests.empty())
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+    def test_text_deployment_defaults_and_bindings_survive_copy_and_load(self):
+        from synapse.ml.services.openai.OpenAIChatCompletion import OpenAIChatCompletion
+        from synapse.ml.services.openai.OpenAIResponses import OpenAIResponses
+
+        for stage_type in (OpenAIChatCompletion, OpenAIResponses, OpenAIPrompt):
+            for binding in ("default", "explicit-default", "scalar", "column"):
+                with self.subTest(stage=stage_type.__name__, binding=binding):
+                    stage = stage_type()
+                    if binding == "scalar":
+                        stage.setParams(deploymentName="custom-deployment")
+                    elif binding == "explicit-default":
+                        stage.setParams(deploymentName="gpt-6-luna")
+                    elif binding == "column":
+                        stage.setDeploymentNameCol("deployment")
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = os.path.join(directory, "stage")
+                        stage.save(path)
+                        config = "spark.synapseml.legacy.allowUnsafeJavaDeserialization"
+                        previous = spark.conf.get(config, None)
+                        try:
+                            spark.conf.set(config, "false")
+                            restored = stage_type.load(path)
+                        finally:
+                            if previous is None:
+                                spark.conf.unset(config)
+                            else:
+                                spark.conf.set(config, previous)
+                        for candidate in (stage, stage.copy(), restored):
+                            candidate._transfer_params_to_java()
+                            if binding == "column":
+                                self.assertEqual(
+                                    candidate.getDeploymentNameCol(), "deployment"
+                                )
+                            else:
+                                self.assertEqual(
+                                    candidate.getDeploymentName(),
+                                    (
+                                        "gpt-6-luna"
+                                        if binding in ("default", "explicit-default")
+                                        else "custom-deployment"
+                                    ),
+                                )
+                            java_param = candidate._java_obj.getParam("deploymentName")
+                            self.assertEqual(
+                                candidate._java_obj.isSet(java_param),
+                                binding != "default",
+                            )
+
+    def test_scala_saved_default_columns_survive_python_pipeline_load(self):
+        java_stage = (
+            spark._jvm.com.microsoft.azure.synapse.ml.services.openai.OpenAIPrompt()
+            .setUrl("http://127.0.0.1:1/openai/v1/")
+            .setSubscriptionKey("unused")
+            .setPromptTemplate("{text}")
+        )
+        output_column = java_stage.getOutputCol()
+        error_column = java_stage.getErrorCol()
+        with tempfile.TemporaryDirectory() as directory:
+            stage_path = os.path.join(directory, "scala-stage")
+            java_stage.write().save(stage_path)
+            restored = OpenAIPrompt.load(stage_path)
+            for candidate in (restored, restored.copy({})):
+                self.assertEqual(candidate.getOutputCol(), output_column)
+                self.assertEqual(candidate.getErrorCol(), error_column)
+                candidate._transfer_params_to_java()
+                self.assertEqual(candidate._java_obj.getOutputCol(), output_column)
+                self.assertEqual(candidate._java_obj.getErrorCol(), error_column)
+            pipeline = PipelineModel(
+                stages=[restored, SelectColumns().setCols([output_column])]
+            )
+            pipeline_path = os.path.join(directory, "pipeline")
+            pipeline.save(pipeline_path)
+            loaded = PipelineModel.load(pipeline_path)
+            result = loaded.transform(spark.createDataFrame([], "text string"))
+            self.assertEqual(result.columns, [output_column])
+            self.assertEqual(result.collect(), [])
+
+    def test_cache_options_preserve_provider_values_and_json_types(self):
+        from synapse.ml.services.openai.OpenAIChatCompletion import OpenAIChatCompletion
+        from synapse.ml.services.openai.OpenAIResponses import OpenAIResponses
+        from synapse.ml.services.aifoundry.AIFoundryChatCompletion import (
+            AIFoundryChatCompletion,
+        )
+
+        for stage_type in (
+            OpenAIChatCompletion,
+            OpenAIResponses,
+            OpenAIPrompt,
+            AIFoundryChatCompletion,
+        ):
+            with self.subTest(stage=stage_type.__name__):
+                options = {"mode": "explicit", "ttl": "12h", "prewarm": True}
+                stage = stage_type().setParams(promptCacheOptions=options)
+                self.assertEqual(stage.getPromptCacheOptions(), options)
+                self.assertIs(stage.getPromptCacheOptions()["prewarm"], True)
+                copied = stage.copy()
+                self.assertEqual(copied.getPromptCacheOptions(), options)
+                self.assertIs(copied.getPromptCacheOptions()["prewarm"], True)
+                copied.setPromptCacheOptions({"ttl": "not-a-cache-lifetime"})
+                self.assertEqual(
+                    copied.getPromptCacheOptions(), {"ttl": "not-a-cache-lifetime"}
+                )
+                self.assertEqual(stage.getPromptCacheOptions(), options)
+                self.assertIs(stage.getPromptCacheOptions()["prewarm"], True)
+
+    def test_cache_option_bindings_survive_save_and_load(self):
+        for column_binding in (False, True):
+            with self.subTest(column_binding=column_binding):
+                stage = OpenAIPrompt().setPromptCacheOptions(
+                    {"mode": "explicit", "ttl": "30m", "prewarm": True}
+                )
+                if column_binding:
+                    stage.setPromptCacheOptionsCol("cache_options")
+                with tempfile.TemporaryDirectory() as directory:
+                    path = os.path.join(directory, "stage")
+                    stage.save(path)
+                    restored = OpenAIPrompt.load(path)
+                    if column_binding:
+                        self.assertEqual(
+                            restored.getPromptCacheOptionsCol(), "cache_options"
+                        )
+                    else:
+                        self.assertEqual(
+                            restored.getPromptCacheOptions(),
+                            {"mode": "explicit", "ttl": "30m", "prewarm": True},
+                        )
+                        self.assertIs(restored.getPromptCacheOptions()["prewarm"], True)
+
+    @contextmanager
+    def assert_no_jvm_calls(self):
+        client = spark.sparkContext._gateway._gateway_client
+        with patch.object(client, "send_command", wraps=client.send_command) as send:
+            yield
+        # Py4J may release unrelated object references during Python garbage collection.
+        calls = [
+            call for call in send.call_args_list if not call.args[0].startswith("m\n")
+        ]
+        self.assertEqual(len(calls), 0, "Configuration must not call the JVM")
+
+    def test_ordinary_set_params_does_not_call_jvm(self):
+        for stage_type in (OpenAIEmbedding, OpenAIPrompt):
+            with self.subTest(stage=stage_type.__name__):
+                stage = stage_type()
+                with self.assert_no_jvm_calls():
+                    stage.setParams(outputCol="first")
+                    stage.setParams(outputCol="second", concurrency=2)
+                    self.assertIs(stage.setParams(), stage)
+                self.assertEqual(stage.getOutputCol(), "second")
+                self.assertEqual(stage.getConcurrency(), 2)
+
+    def test_nonservice_wrapper_uses_empty_local_metadata(self):
+        stage = SelectColumns()
+        self.assertEqual(stage._service_param_names, frozenset())
+        with self.assert_no_jvm_calls():
+            stage.setParams(cols=["text", "result"])
+        self.assertEqual(stage.getCols(), ["text", "result"])
+
+    def test_prompt_ordinary_updates_remain_atomic_without_jvm(self):
+        prompt = OpenAIPrompt().setOutputCol("original")
+        prompt.set(prompt.temperature, 0.5)
+        original_param_map = prompt._paramMap
+        with self.assert_no_jvm_calls():
+            with self.assertRaises(TypeError):
+                prompt.setParams(outputCol="changed", concurrency="invalid")
+        self.assertIs(prompt._paramMap, original_param_map)
+        self.assertEqual(prompt.getOutputCol(), "original")
+        self.assertEqual(prompt.getOrDefault(prompt.temperature), 0.5)
+
+    def test_generated_service_argument_metadata_does_not_call_jvm(self):
+        embedding = OpenAIEmbedding()
+        self.assertIsInstance(embedding._service_param_names, frozenset)
+        with self.assert_no_jvm_calls():
+            for argument in ("text", "textCol"):
+                self.assertEqual(
+                    embedding._service_param_name_for_argument(argument), "text"
+                )
+            for argument in ("outputCol", "unknown"):
+                self.assertIsNone(embedding._service_param_name_for_argument(argument))
+            with self.assertRaises(ValueError):
+                embedding._validate_service_param_arguments(
+                    {"text": "value", "textCol": "body"}
+                )
+            with self.assertRaises(TypeError):
+                embedding._validate_service_param_arguments({"textCol": None})
+
+    def test_legacy_wrappers_without_service_metadata_remain_supported(self):
+        embedding = OpenAIEmbedding()
+        with patch.object(OpenAIEmbedding, "_service_param_names", None, create=True):
+            embedding.setParams(textCol="body", outputCol="result")
+            self.assertEqual(embedding.getTextCol(), "body")
+            self.assertEqual(embedding.getOutputCol(), "result")
+
+    def test_transfer_does_not_inspect_every_unset_param(self):
+        embedding = OpenAIEmbedding()
+        java_obj = embedding._java_obj
+
+        class CountingJavaObject:
+            def __init__(self, delegate):
+                self.delegate = delegate
+                self.get_param_calls = 0
+
+            def getParam(self, name):
+                self.get_param_calls += 1
+                return self.delegate.getParam(name)
+
+            def __getattr__(self, name):
+                return getattr(self.delegate, name)
+
+        counting_java_obj = CountingJavaObject(java_obj)
+        embedding._java_obj = counting_java_obj
+        embedding._transfer_params_to_java()
+
+        expected_default_transfers = sum(
+            embedding.hasDefault(param) for param in embedding.params
+        )
+        self.assertEqual(counting_java_obj.get_param_calls, expected_default_transfers)
+
+    def test_generated_accessors_support_scalar_and_column_values(self):
+        embedding = OpenAIEmbedding(textCol="body")
+        self.assertEqual(embedding.getTextCol(), "body")
+
+        embedding.setDimensionsCol("embedding_size")
+        self.assertEqual(embedding.getDimensionsCol(), "embedding_size")
+
+        sentiment = TextSentiment().setText(["hello"])
+        self.assertEqual(sentiment.getText(), ["hello"])
+
+        headers = {"trace-id": "test"}
+        embedding.setTelemHeaders(headers)
+        self.assertEqual(embedding.getTelemHeaders(), headers)
+
+    def test_set_params_dispatches_service_arguments_through_setters(self):
+        embedding = OpenAIEmbedding().setParams(textCol="body")
+        self.assertEqual(embedding.getTextCol(), "body")
+
+        prompt = OpenAIPrompt().setParams(temperatureCol="sampling")
+        self.assertEqual(prompt.getTemperatureCol(), "sampling")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Cannot set both 'text' and 'textCol' in the same call",
+        ):
+            OpenAIEmbedding().setParams(text="hello", textCol="body")
+
+        embedding = OpenAIEmbedding(text=None, textCol="body")
+        self.assertEqual(embedding.getTextCol(), "body")
+
+        with self.assertRaisesRegex(
+            TypeError, "Service parameter 'textCol' cannot be None"
+        ):
+            OpenAIEmbedding().setParams(textCol=None)
+
+    def test_getters_preserve_unset_and_wrong_binding_errors(self):
+        with self.assertRaises(Py4JJavaError):
+            OpenAIEmbedding().getText()
+        with self.assertRaises(Py4JJavaError):
+            OpenAIEmbedding(text="hello").getTextCol()
+        with self.assertRaises(Py4JJavaError):
+            OpenAIEmbedding(textCol="body").getText()
+
+    def test_java_transfer_does_not_restore_stale_service_values(self):
+        source = OpenAIEmbedding(text="original")
+        restored = OpenAIEmbedding._from_java(source._java_obj)
+
+        self.assertFalse(restored.isSet(restored.text))
+        restored.setText("updated")
+        restored._transfer_params_to_java()
+
+        self.assertEqual(restored.getText(), "updated")
+
+    def test_copy_preserves_columns_and_consumes_scalar_extra_values(self):
+        column_source = OpenAIEmbedding(textCol="body")
+        column_copy = column_source.copy()
+        self.assertEqual(column_copy.getTextCol(), "body")
+
+        scalar_copy = column_source.copy({column_source.text: "updated"})
+        self.assertEqual(scalar_copy.getText(), "updated")
+        self.assertFalse(scalar_copy.isSet(scalar_copy.text))
+
+        restored = OpenAIEmbedding._from_java(column_source._java_obj)
+        restored_copy = restored.copy()
+        self.assertEqual(restored_copy.getTextCol(), "body")
+
+        restored_copy.setText("scalar")
+        self.assertEqual(restored_copy.getText(), "scalar")
+        with self.assertRaises(Py4JJavaError):
+            restored_copy.getTextCol()
+
+    def test_named_service_setters_replace_pending_generic_values(self):
+        for use_column in (False, True):
+            with self.subTest(use_column=use_column):
+                embedding = OpenAIEmbedding()
+                embedding.set(embedding.text, "old")
+                if use_column:
+                    embedding.setTextCol("body")
+                else:
+                    embedding.setText("new")
+
+                self.assertFalse(embedding.isSet(embedding.text))
+                embedding._transfer_params_to_java()
+                copied = embedding.copy()
+                for stage in (embedding, copied):
+                    if use_column:
+                        self.assertEqual(stage.getTextCol(), "body")
+                    else:
+                        self.assertEqual(stage.getText(), "new")
+
+    def test_set_params_replaces_pending_generic_service_value(self):
+        embedding = OpenAIEmbedding()
+        embedding.set(embedding.text, "old")
+        embedding.setParams(textCol="body")
+        embedding._transfer_params_to_java()
+
+        self.assertEqual(embedding.getTextCol(), "body")
+        self.assertFalse(embedding.isSet(embedding.text))
+
+    def test_generic_service_set_after_named_setter_remains_latest(self):
+        embedding = OpenAIEmbedding(textCol="body")
+        embedding.set(embedding.text, "new")
+        embedding._transfer_params_to_java()
+
+        self.assertEqual(embedding.getText(), "new")
+        self.assertFalse(embedding.isSet(embedding.text))
+
+    def test_failed_named_service_setter_preserves_pending_value(self):
+        embedding = OpenAIEmbedding()
+        embedding.set(embedding.text, "pending")
+
+        with self.assertRaises(Py4JError):
+            embedding.setTextCol(123)
+
+        self.assertEqual(embedding.getOrDefault(embedding.text), "pending")
+        embedding._transfer_params_to_java()
+        self.assertEqual(embedding.getText(), "pending")
+
+    def test_named_service_updates_survive_save_and_load(self):
+        for use_column in (False, True):
+            with self.subTest(use_column=use_column):
+                prompt = OpenAIPrompt()
+                prompt.set(prompt.temperature, 0.25)
+                if use_column:
+                    prompt.setTemperatureCol("sampling")
+                else:
+                    prompt.setTemperature(0.75)
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    path = os.path.join(temp_dir, "prompt")
+                    prompt.save(path)
+                    loaded = OpenAIPrompt.load(path)
+                    loaded._transfer_params_to_java()
+                    if use_column:
+                        self.assertEqual(loaded.getTemperatureCol(), "sampling")
+                    else:
+                        self.assertEqual(loaded.getTemperature(), 0.75)
+
+    def test_transform_extra_service_value_uses_public_pyspark_path(self):
+        embedding = OpenAIEmbedding(textCol="body")
+
+        with patch.object(
+            OpenAIEmbedding,
+            "_transform",
+            lambda copied, dataset: copied.getText(),
+        ):
+            result = embedding.transform(
+                spark.range(0),
+                {embedding.text: "updated"},
+            )
+
+        self.assertEqual(result, "updated")
+        self.assertEqual(embedding.getTextCol(), "body")
+
+    def test_transform_preserves_latest_binding_without_service_requests(self):
+        embedding = (
+            OpenAIEmbedding()
+            .setUrl("http://127.0.0.1:1/")
+            .setDeploymentName("unused")
+            .setSubscriptionKey("unused")
+            .setOutputCol("embedding")
+        )
+        embedding.set(embedding.text, "old")
+        embedding.setTextCol("body")
+
+        result = embedding.transform(spark.createDataFrame([], "body string"))
+
+        self.assertIn("embedding", result.columns)
+        self.assertEqual(result.count(), 0)
+        self.assertEqual(embedding.getTextCol(), "body")
+
+    def test_openai_prompt_service_updates_remain_atomic(self):
+        prompt = OpenAIPrompt().setTemperature(0.25)
+
+        with self.assertRaises(TypeError):
+            prompt.setParams(
+                temperatureCol="sampling",
+                concurrency="not-an-integer",
+            )
+
+        self.assertEqual(prompt.getTemperature(), 0.25)
+
+    def test_openai_prompt_validates_service_updates_on_scratch_copy(self):
+        prompt = OpenAIPrompt().setTemperature(0.25)
+        original_java_id = prompt._java_obj._target_id
+        setter_java_ids = []
+        set_temperature_col = prompt.setTemperatureCol
+
+        def record_setter(value):
+            setter_java_ids.append(prompt._java_obj._target_id)
+            return set_temperature_col(value)
+
+        prompt.setTemperatureCol = record_setter
+        prompt.setParams(temperatureCol="sampling")
+
+        self.assertEqual(len(setter_java_ids), 2)
+        self.assertNotEqual(setter_java_ids[0], original_java_id)
+        self.assertEqual(setter_java_ids[1], original_java_id)
+        self.assertEqual(prompt.getTemperatureCol(), "sampling")
+
+    def test_failed_atomic_update_preserves_pending_service_values(self):
+        prompt = OpenAIPrompt().setTemperature(0.25)
+        prompt.set(prompt.temperature, 0.5)
+        original_param_map = prompt._paramMap
+
+        with self.assertRaises(IllegalArgumentException):
+            prompt.setParams(
+                temperatureCol="sampling",
+                responseFormat="invalid_format",
+            )
+
+        self.assertIs(prompt._paramMap, original_param_map)
+        self.assertEqual(prompt.getTemperature(), 0.25)
+        self.assertEqual(prompt.getOrDefault(prompt.temperature), 0.5)
+        prompt._transfer_params_to_java()
+        self.assertEqual(prompt.getTemperature(), 0.5)
+
+    def test_successful_atomic_update_replaces_pending_service_value(self):
+        prompt = OpenAIPrompt().setTemperature(0.25)
+        prompt.set(prompt.temperature, 0.5)
+        prompt.setParams(temperatureCol="sampling")
+        prompt._transfer_params_to_java()
+
+        self.assertEqual(prompt.getTemperatureCol(), "sampling")
+        self.assertFalse(prompt.isSet(prompt.temperature))
+
+    def test_ordinary_params_keep_python_param_behavior(self):
+        embedding = OpenAIEmbedding().setParams(outputCol="vector")
+
+        self.assertTrue(embedding.isSet(embedding.outputCol))
+        self.assertEqual(embedding.getOutputCol(), "vector")
+
+
+if __name__ == "__main__":
+    unittest.main()

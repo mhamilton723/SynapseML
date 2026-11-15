@@ -5,20 +5,49 @@ package com.microsoft.azure.synapse.ml.services.openai
 
 import com.microsoft.azure.synapse.ml.core.test.base.Flaky
 import org.apache.spark.sql.{DataFrame, Row}
+import org.scalatest.TestData
 
 class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
 
   import spark.implicits._
 
+  private def resetDefaults(): Unit = {
+    OpenAIDefaults.resetDeploymentName()
+    OpenAIDefaults.resetSubscriptionKey()
+    OpenAIDefaults.resetTemperature()
+    OpenAIDefaults.resetSeed()
+    OpenAIDefaults.resetTopP()
+    OpenAIDefaults.resetURL()
+    OpenAIDefaults.resetApiVersion()
+    OpenAIDefaults.resetModel()
+    OpenAIDefaults.resetEmbeddingDeploymentName()
+    OpenAIDefaults.resetVerbosity()
+    OpenAIDefaults.resetReasoningEffort()
+    OpenAIDefaults.resetApiType()
+  }
+
+  protected override def beforeEach(td: TestData): Unit = {
+    super.beforeEach(td)
+    resetDefaults()
+  }
+
+  protected override def afterEach(td: TestData): Unit = {
+    try {
+      resetDefaults()
+    } finally {
+      super.afterEach(td)
+    }
+  }
+
   def promptCompletion: OpenAIChatCompletion = new OpenAIChatCompletion()
-    .setMaxTokens(200)
+    .setMaxCompletionTokens(1000)
     .setOutputCol("out")
     .setMessagesCol("prompt")
 
   lazy val promptDF: DataFrame = Seq(
     Seq(
       OpenAIMessage("system", "You are an AI chatbot with red as your favorite color"),
-      OpenAIMessage("user", "Whats your favorite color")
+      OpenAIMessage("user", "What is your favorite color? Reply in a full sentence.")
     ),
     Seq(
       OpenAIMessage("system", "You are very excited"),
@@ -35,10 +64,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
   test("Completion w Globals") {
     OpenAIDefaults.setDeploymentName(deploymentName)
     OpenAIDefaults.setSubscriptionKey(openAIAPIKey)
-    OpenAIDefaults.setTemperature(0.05)
+    OpenAIDefaults.setReasoningEffort("low")
     OpenAIDefaults.setURL(s"https://$openAIServiceName.openai.azure.com/")
 
-    val fromRow = ChatCompletionResponse.makeFromRowConverter
+    val fromRow = ChatModelResponse.makeFromRowConverter
     promptCompletion.transform(promptDF).collect().foreach(r =>
       fromRow(r.getAs[Row]("out")).choices.foreach(c =>
         assert(c.message.content.length > 10)))
@@ -57,7 +86,7 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
   test("OpenAIPrompt w Globals") {
     OpenAIDefaults.setDeploymentName(deploymentName)
     OpenAIDefaults.setSubscriptionKey(openAIAPIKey)
-    OpenAIDefaults.setTemperature(0.05)
+    OpenAIDefaults.setReasoningEffort("low")
     OpenAIDefaults.setURL(s"https://$openAIServiceName.openai.azure.com/")
 
     val nonNullCount = prompt
@@ -72,7 +101,6 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
 
     assert(prompt.getDeploymentName == deploymentName)
     assert(prompt.getSubscriptionKey == openAIAPIKey)
-    assert(prompt.getTemperature == 0.05)
   }
 
   test("Test Getters") {
@@ -84,6 +112,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     OpenAIDefaults.setURL(s"https://$openAIServiceName.openai.azure.com/")
     OpenAIDefaults.setApiVersion("2024-05-01-preview")
     OpenAIDefaults.setModel("grok-3-mini")
+    OpenAIDefaults.setEmbeddingDeploymentName("text-embedding-ada-002")
+    OpenAIDefaults.setVerbosity("medium")
+    OpenAIDefaults.setReasoningEffort("medium")
+    OpenAIDefaults.setApiType("responses")
 
     assert(OpenAIDefaults.getDeploymentName.contains(deploymentName))
     assert(OpenAIDefaults.getSubscriptionKey.contains(openAIAPIKey))
@@ -93,6 +125,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     assert(OpenAIDefaults.getURL.contains(s"https://$openAIServiceName.openai.azure.com/"))
     assert(OpenAIDefaults.getApiVersion.contains("2024-05-01-preview"))
     assert(OpenAIDefaults.getModel.contains("grok-3-mini"))
+    assert(OpenAIDefaults.getEmbeddingDeploymentName.contains("text-embedding-ada-002"))
+    assert(OpenAIDefaults.getVerbosity.contains("medium"))
+    assert(OpenAIDefaults.getReasoningEffort.contains("medium"))
+    assert(OpenAIDefaults.getApiType.contains("responses"))
   }
 
   test("Test Resetters") {
@@ -104,6 +140,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     OpenAIDefaults.setURL(s"https://$openAIServiceName.openai.azure.com/")
     OpenAIDefaults.setApiVersion("2024-05-01-preview")
     OpenAIDefaults.setModel("grok-3-mini")
+    OpenAIDefaults.setEmbeddingDeploymentName("text-embedding-ada-002")
+    OpenAIDefaults.setVerbosity("medium")
+    OpenAIDefaults.setReasoningEffort("medium")
+    OpenAIDefaults.setApiType("responses")
 
     OpenAIDefaults.resetDeploymentName()
     OpenAIDefaults.resetSubscriptionKey()
@@ -113,6 +153,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     OpenAIDefaults.resetURL()
     OpenAIDefaults.resetApiVersion()
     OpenAIDefaults.resetModel()
+    OpenAIDefaults.resetEmbeddingDeploymentName()
+    OpenAIDefaults.resetVerbosity()
+    OpenAIDefaults.resetReasoningEffort()
+    OpenAIDefaults.resetApiType()
 
     assert(OpenAIDefaults.getDeploymentName.isEmpty)
     assert(OpenAIDefaults.getSubscriptionKey.isEmpty)
@@ -122,6 +166,10 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     assert(OpenAIDefaults.getURL.isEmpty)
     assert(OpenAIDefaults.getApiVersion.isEmpty)
     assert(OpenAIDefaults.getModel.isEmpty)
+    assert(OpenAIDefaults.getEmbeddingDeploymentName.isEmpty)
+    assert(OpenAIDefaults.getVerbosity.isEmpty)
+    assert(OpenAIDefaults.getReasoningEffort.isEmpty)
+    assert(OpenAIDefaults.getApiType.isEmpty)
   }
 
   test("Test Parameter Validation") {
@@ -129,16 +177,16 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     OpenAIDefaults.setTemperature(0.0)
     OpenAIDefaults.setTemperature(1.0)
     OpenAIDefaults.setTemperature(2.0)
-    OpenAIDefaults.setTemperature(0)  // int should work
-    OpenAIDefaults.setTemperature(1)  // int should work
-    OpenAIDefaults.setTemperature(2)  // int should work
+    OpenAIDefaults.setTemperature(0)
+    OpenAIDefaults.setTemperature(1)
+    OpenAIDefaults.setTemperature(2)
 
     // Test valid topP values
     OpenAIDefaults.setTopP(0.0)
     OpenAIDefaults.setTopP(0.5)
     OpenAIDefaults.setTopP(1.0)
-    OpenAIDefaults.setTopP(0)  // int should work
-    OpenAIDefaults.setTopP(1)  // int should work
+    OpenAIDefaults.setTopP(0)
+    OpenAIDefaults.setTopP(1)
 
     // Test invalid temperature values
     assertThrows[IllegalArgumentException] {
@@ -155,5 +203,13 @@ class OpenAIDefaultsSuite extends Flaky with OpenAIAPIKey {
     assertThrows[IllegalArgumentException] {
       OpenAIDefaults.setTopP(1.1)
     }
+
+    // Test verbosity values
+    OpenAIDefaults.setVerbosity("low")
+    OpenAIDefaults.setVerbosity("anything")
+
+    // Test reasoning effort values
+    OpenAIDefaults.setReasoningEffort("low")
+    OpenAIDefaults.setReasoningEffort("anything")
   }
 }

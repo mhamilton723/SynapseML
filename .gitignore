@@ -58,6 +58,7 @@ htmlcov
 
 # Files created by remark-link
 package-lock.json
+!website/package-lock.json
 node_modules/
 .Rproj.user
 
@@ -88,3 +89,10 @@ metastore_db/
 **/dist/*
 **/*.egg-info/*
 
+*_local\.*
+condaenv.*.requirements.txt
+*.env
+
+# Dev-loop artifacts
+.dev-loop/
+.dev-loop-artifacts/

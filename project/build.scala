@@ -24,9 +24,14 @@ object BuildUtils {
   }
 
   def pythonizedVersion(version: String): String = {
+    // PEP 440 normalizes version strings to lowercase, and pip/wheel create filenames
+    // using the normalized version. We must match this to find the wheel file.
     version match {
-      case s if s.contains("-") => s.split("-".head).head + ".dev1"
-      case s => s
+      case s if s.contains("-") =>
+        val Array(base, suffix @ _*) = s.split("-", 2)
+        // Use a PEP 440 local version to preserve the spark suffix (e.g., 1.1.0+spark4.0)
+        (base + "+" + suffix.mkString.replace("-", ".")).toLowerCase
+      case s => s.toLowerCase
     }
   }
 
@@ -67,8 +72,11 @@ object BuildUtils {
   def activateCondaEnv: Seq[String] = {
     if (sys.props("os.name").toLowerCase.contains("windows")) {
       osPrefix ++ Seq("activate", condaEnvName, "&&")
-    } else {
+    } else if (sys.env.get("CONDA_DEFAULT_ENV").contains(condaEnvName)) {
+      // Avoid nesting `conda run` inside an already activated environment.
       Seq()
+    } else {
+      Seq("conda", "run", "-n", condaEnvName, "--no-capture-output")
       //TODO figure out why this doesn't work
       //Seq("/bin/bash", "-l", "-c", "source activate " + condaEnvName, "&&")
     }

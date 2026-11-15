@@ -6,7 +6,7 @@ package com.microsoft.azure.synapse.ml.train
 import com.microsoft.azure.synapse.ml.codegen.Wrappable
 import com.microsoft.azure.synapse.ml.core.contracts._
 import com.microsoft.azure.synapse.ml.core.metrics.{MetricConstants, MetricUtils}
-import com.microsoft.azure.synapse.ml.core.schema.{CategoricalUtilities, SchemaConstants, SparkSchema}
+import com.microsoft.azure.synapse.ml.core.schema.{CategoricalUtilities, SchemaConstants}
 import com.microsoft.azure.synapse.ml.logging.{FeatureNames, SynapseMLLogging}
 import org.apache.log4j.Logger
 import org.apache.spark.ml.Transformer
@@ -17,11 +17,19 @@ import org.apache.spark.mllib.evaluation.{BinaryClassificationMetrics, Multiclas
 import org.apache.spark.mllib.linalg.{Matrices, Matrix}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 
-object ComputeModelStatistics extends DefaultParamsReadable[ComputeModelStatistics]
+object ComputeModelStatistics extends DefaultParamsReadable[ComputeModelStatistics] {
+  private def getPositiveClassScore(scores: Vector, scoresColumnName: String): Double = {
+    if (scores.size < 2) {
+      throw new IllegalArgumentException(
+        s"ComputeModelStatistics scoresCol '$scoresColumnName' vectors must contain at least two values.")
+    }
+    scores(1)
+  }
+}
 
 trait ComputeModelStatisticsParams extends Wrappable with DefaultParamsWritable
   with HasLabelCol with HasScoresCol with HasScoredLabelsCol with HasEvaluationMetric {
@@ -30,8 +38,9 @@ trait ComputeModelStatisticsParams extends Wrappable with DefaultParamsWritable
     * The metrics that can be chosen are:
     *
     *   For binary classification:
-    *     - areaUnderROC
+    *     - areaUnderROC (reported in the AUC column)
     *     - AUC
+    *     - areaUnderPR
     *     - accuracy
     *     - precision
     *     - recall
@@ -45,9 +54,9 @@ trait ComputeModelStatisticsParams extends Wrappable with DefaultParamsWritable
     *   Or, for either:
     *     - all - This will report all the relevant metrics
     *
-    *   If using a native Spark ML model, you will need to specify either "classifier" or "regressor"
-    *     - classifier
-    *     - regressor
+    *   If scoring metadata is unavailable, specify the evaluation kind:
+    *     - classification
+    *     - regression
     *
     * @group param
     */
@@ -65,6 +74,8 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
   var rocCurve: DataFrame = _
 
   lazy val metricsLogger = new MetricsLogger(uid)
+  private val selectedPredictionColumn = "__synapseml_prediction"
+  private val selectedLabelColumn = "__synapseml_label"
 
   /** Calculates the metrics for the given dataset and model.
     * @param dataset the dataset to calculate the metrics for
@@ -74,24 +85,23 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
   //scalastyle:off cyclomatic.complexity
   override def transform(dataset: Dataset[_]): DataFrame = {
     logTransform[DataFrame]({
-      val (modelName, labelColumnName, scoreValueKind) =
-        MetricUtils.getSchemaInfo(
-          dataset.schema,
-          if (isDefined(labelCol)) Some(getLabelCol) else None,
-          getEvaluationMetric)
+      val caseSensitive = isCaseSensitive(dataset.sparkSession)
+      val (modelName, resolvedLabelColumnName, scoreValueKind) =
+        resolveSchemaInfo(dataset.schema, caseSensitive)
+      val inputColumns =
+        validateInputColumns(
+          dataset.schema, modelName, resolvedLabelColumnName, scoreValueKind, caseSensitive)
+      val labelColumnName = inputColumns.labelColumnName
 
       // For creating the result dataframe in classification or regression case
       val spark = dataset.sparkSession
       import spark.implicits._
 
       if (scoreValueKind == SchemaConstants.ClassificationKind) {
-
+        val scoredLabelsColumnName = inputColumns.scoredLabelsColumnName.get
         var resultDF: DataFrame =
           Seq(MetricConstants.ClassificationEvaluationType)
             .toDF(MetricConstants.EvaluationType)
-        val scoredLabelsColumnName =
-          if (isDefined(scoredLabelsCol)) getScoredLabelsCol
-          else SparkSchema.getSparkPredictionColumnName(dataset.schema, modelName)
 
         // Get levels for label column if categorical
         val levels = CategoricalUtilities.getLevels(dataset.schema, labelColumnName)
@@ -107,12 +117,12 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
             selectAndCastToRDD(dataset, scoredLabelsColumnName, labelColumnName)
 
         lazy val scoresAndLabels = {
-          val scoresColumnName =
-            if (isDefined(scoresCol)) getScoresCol
-            else SparkSchema.getSparkRawPredictionColumnName(dataset.schema, modelName)
-          if (scoresColumnName == null) predictionAndLabels
-          else if (levelsExist) getScoresAndLabels(dataset, labelColumnName, scoresColumnName, levelsToIndexMap)
-          else getScalarScoresAndLabels(dataset, labelColumnName, scoresColumnName)
+          inputColumns.scoresColumnName match {
+            case Some(columnName) if levelsExist =>
+              getScoresAndLabels(dataset, labelColumnName, columnName, levelsToIndexMap)
+            case Some(columnName) => getScalarScoresAndLabels(dataset, labelColumnName, columnName)
+            case None => predictionAndLabels
+          }
         }
 
         lazy val (labels: Array[Double], confusionMatrix: Matrix) = createConfusionMatrix(predictionAndLabels)
@@ -129,30 +139,34 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
             simpleMetric == MetricConstants.PrecisionSparkMetric ||
             simpleMetric == MetricConstants.RecallSparkMetric =>
             resultDF = addSimpleMetric(simpleMetric, predictionAndLabels, resultDF)
-          case MetricConstants.AucSparkMetric =>
+          case MetricConstants.AucSparkMetric | MetricConstants.AreaUnderROCMetric =>
             val numLevels = if (levelsExist) levels.get.length
             else confusionMatrix.numRows
             if (numLevels <= 2) {
-              // Add the AUC
-              val auc: Double = getAUC(modelName, dataset, labelColumnName, scoresAndLabels)
+              val auc = getAUC(modelName, dataset, labelColumnName, scoresAndLabels)
               resultDF = resultDF.withColumn(MetricConstants.AucColumnName, lit(auc))
             } else {
               throw new Exception("Error: AUC is not available for multiclass case")
             }
+          case MetricConstants.AreaUnderPRMetric =>
+            val numLevels = if (levelsExist) levels.get.length
+            else confusionMatrix.numRows
+            if (numLevels <= 2) {
+              val areaUnderPR = getAreaUnderPR(scoresAndLabels)
+              resultDF = resultDF.withColumn(MetricConstants.AreaUnderPRColumnName, lit(areaUnderPR))
+            } else {
+              throw new Exception("Error: areaUnderPR is not available for multiclass case")
+            }
           case default =>
-            throw new Exception(s"Error: $default is not a classification metric")
+            throwOnInvalidEvaluationMetric(
+              default, SchemaConstants.ClassificationKind, MetricConstants.ClassificationMetrics)
         }
         resultDF
       } else if (scoreValueKind == SchemaConstants.RegressionKind) {
-        val scoresColumnName =
-          if (isDefined(scoresCol)) getScoresCol
-          else SparkSchema.getSparkPredictionColumnName(dataset.schema, modelName)
+        val scoresColumnName = inputColumns.scoresColumnName.get
 
         val scoresAndLabels = selectAndCastToRDD(dataset, scoresColumnName, labelColumnName)
-
         val regressionMetrics = new RegressionMetrics(scoresAndLabels)
-
-        // get all spark metrics possible: "mse", "rmse", "r2", "mae"
         val mse = regressionMetrics.meanSquaredError
         val rmse = regressionMetrics.rootMeanSquaredError
         val r2 = regressionMetrics.r2
@@ -160,10 +174,24 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
 
         metricsLogger.logRegressionMetrics(mse, rmse, r2, mae)
 
-        Seq((mse, rmse, r2, mae)).toDF(MetricConstants.MseColumnName,
-          MetricConstants.RmseColumnName,
-          MetricConstants.R2ColumnName,
-          MetricConstants.MaeColumnName)
+        getEvaluationMetric match {
+          case MetricConstants.AllSparkMetrics | MetricConstants.RegressionMetricsName =>
+            Seq((mse, rmse, r2, mae)).toDF(MetricConstants.MseColumnName,
+              MetricConstants.RmseColumnName,
+              MetricConstants.R2ColumnName,
+              MetricConstants.MaeColumnName)
+          case MetricConstants.MseSparkMetric =>
+            Seq(mse).toDF(MetricConstants.MseColumnName)
+          case MetricConstants.RmseSparkMetric =>
+            Seq(rmse).toDF(MetricConstants.RmseColumnName)
+          case MetricConstants.R2SparkMetric =>
+            Seq(r2).toDF(MetricConstants.R2ColumnName)
+          case MetricConstants.MaeSparkMetric =>
+            Seq(mae).toDF(MetricConstants.MaeColumnName)
+          case default =>
+            throwOnInvalidEvaluationMetric(
+              default, SchemaConstants.RegressionKind, MetricConstants.RegressionMetrics)
+        }
       } else {
         throwOnInvalidScoringKind(scoreValueKind)
       }
@@ -171,6 +199,122 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
   }
   //scalastyle:on method.length
   //scalastyle:on cyclomatic.complexity
+
+  private def validateInputColumns(schema: StructType,
+                                   modelName: String,
+                                   labelColumnName: String,
+                                   scoreValueKind: String,
+                                   caseSensitive: Boolean):
+      ComputeModelStatisticsInputValidator.ValidatedInputColumns = {
+    ComputeModelStatisticsInputValidator.validate(
+      schema,
+      modelName,
+      labelColumnName,
+      scoreValueKind,
+      if (isDefined(scoredLabelsCol)) Some(getScoredLabelsCol) else None,
+      if (isDefined(scoresCol)) Some(getScoresCol) else None,
+      getEvaluationMetric,
+      caseSensitive)
+  }
+
+  private def resolveSchemaInfo(schema: StructType,
+                                caseSensitive: Boolean): (String, String, String) = {
+    validateEvaluationMetric(schema, caseSensitive)
+    if (canEvaluateWithoutMetadata) {
+      getExplicitSchemaInfo(schema, caseSensitive)
+    } else {
+      getMetadataSchemaInfo(schema, caseSensitive)
+    }
+  }
+
+  private def validateEvaluationMetric(schema: StructType, caseSensitive: Boolean): Unit = {
+    if (!validEvaluationMetrics.contains(getEvaluationMetric)) {
+      inferScoreValueKind(schema, caseSensitive) match {
+        case Some(SchemaConstants.ClassificationKind) =>
+          throwOnInvalidEvaluationMetric(
+            getEvaluationMetric,
+            SchemaConstants.ClassificationKind,
+            MetricConstants.ClassificationMetrics)
+        case Some(SchemaConstants.RegressionKind) =>
+          throwOnInvalidEvaluationMetric(
+            getEvaluationMetric,
+            SchemaConstants.RegressionKind,
+            MetricConstants.RegressionMetrics)
+        case _ =>
+          throwOnInvalidEvaluationMetric(
+            getEvaluationMetric,
+            "classification or regression",
+            MetricConstants.ClassificationMetrics ++ MetricConstants.RegressionMetrics)
+      }
+    }
+  }
+
+  private def inferScoreValueKind(schema: StructType, caseSensitive: Boolean): Option[String] = {
+    try {
+      Some(MetricUtils.getSchemaInfo(
+        schema,
+        configuredLabelCol,
+        MetricConstants.AllSparkMetrics,
+        caseSensitive)._3)
+    } catch {
+      case _: IllegalArgumentException => None
+    }
+  }
+
+  private def getExplicitSchemaInfo(schema: StructType,
+                                    caseSensitive: Boolean): (String, String, String) = {
+    val resolvedLabelCol = MetricUtils.resolveLabelColumn(schema, configuredLabelCol, caseSensitive).get
+    ("custom model", resolvedLabelCol, scoreValueKindForMetric)
+  }
+
+  private def getMetadataSchemaInfo(schema: StructType,
+                                    caseSensitive: Boolean): (String, String, String) = {
+    try {
+      MetricUtils.getSchemaInfo(
+        schema,
+        configuredLabelCol,
+        getEvaluationMetric,
+        caseSensitive)
+    } catch {
+      case error: IllegalArgumentException =>
+        if (canFallBackToExplicitSchema(error)) {
+          ("custom model", configuredLabelCol.getOrElse(""), scoreValueKindForMetric)
+        } else {
+          throw error
+        }
+    }
+  }
+
+  private def canFallBackToExplicitSchema(error: IllegalArgumentException): Boolean = {
+    getEvaluationMetric != MetricConstants.AllSparkMetrics &&
+      error.getMessage.startsWith("Unable to determine a complete scored model")
+  }
+
+  private def scoreValueKindForMetric: String = {
+    if (MetricUtils.isClassificationMetric(getEvaluationMetric)) SchemaConstants.ClassificationKind
+    else SchemaConstants.RegressionKind
+  }
+
+  private def configuredLabelCol: Option[String] =
+    if (isDefined(labelCol)) Some(getLabelCol) else None
+
+  private def isCaseSensitive(sparkSession: SparkSession): Boolean =
+    sparkSession.conf.get("spark.sql.caseSensitive", "false").toBoolean
+
+  private def canEvaluateWithoutMetadata: Boolean = {
+    if (!isDefined(labelCol) || getEvaluationMetric == MetricConstants.AllSparkMetrics) {
+      false
+    } else if (MetricUtils.isClassificationMetric(getEvaluationMetric)) {
+      isDefined(scoredLabelsCol)
+    } else {
+      isDefined(scoresCol)
+    }
+  }
+
+  private def validEvaluationMetrics: Set[String] =
+    MetricConstants.ClassificationMetrics ++
+      MetricConstants.RegressionMetrics +
+      MetricConstants.AllSparkMetrics
 
   private def addSimpleMetric(simpleMetric: String,
                               predictionAndLabels: RDD[(Double, Double)],
@@ -220,15 +364,15 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
       val (accuracy: Double, precision: Double, recall: Double)
           = getBinaryAccuracyPrecisionRecall(confusionMatrix)
       metricsLogger.logClassificationMetrics(accuracy, precision, recall)
-      // Add the AUC
-      val auc: Double = getAUC(modelName, dataset, labelColumnName, scoresAndLabels)
-      metricsLogger.logAUC(auc)
+      val (auc, areaUnderPR) =
+        getBinaryMetrics(modelName, dataset, labelColumnName, scoresAndLabels)
       // Add the metrics to the DF
       resultDF
         .withColumn(MetricConstants.AccuracyColumnName, lit(accuracy))
         .withColumn(MetricConstants.PrecisionColumnName, lit(precision))
         .withColumn(MetricConstants.RecallColumnName, lit(recall))
         .withColumn(MetricConstants.AucColumnName, lit(auc))
+        .withColumn(MetricConstants.AreaUnderPRColumnName, lit(areaUnderPR))
     } else {
       val (microAvgAccuracy: Double,
            microAvgPrecision: Double,
@@ -252,18 +396,17 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
                                          confusionMatrix: Matrix,
                                          resultDF: DataFrame): DataFrame = {
     val schema = resultDF.schema.add(MetricConstants.ConfusionMatrix, SQLDataTypes.MatrixType)
-    resultDF.map { row => Row.fromSeq(row.toSeq :+ confusionMatrix.asML) }(RowEncoder(schema))
+    resultDF.map { row => Row.fromSeq(row.toSeq :+ confusionMatrix.asML) }(ExpressionEncoder(schema))
   }
 
   private def selectAndCastToDF(dataset: Dataset[_],
                                 predictionColumnName: String,
                                 labelColumnName: String): DataFrame = {
-    // TODO: We call cache in order to avoid a bug with catalyst where CMS seems to get stuck in a loop
-    // For future spark upgrade past 2.2.0, we should try to see if the cache() call can be removed
-    dataset.select(col(predictionColumnName), col(labelColumnName).cast(DoubleType))
-      .cache()
+    dataset.select(
+      inputColumn(predictionColumnName).cast(DoubleType).as(selectedPredictionColumn),
+      inputColumn(labelColumnName).cast(DoubleType).as(selectedLabelColumn))
       .na
-      .drop(Array(predictionColumnName, labelColumnName))
+      .drop(Array(selectedPredictionColumn, selectedLabelColumn))
   }
 
   private def selectAndCastToRDD(dataset: Dataset[_],
@@ -282,12 +425,11 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
                                      scoredLabelsColumnName: String,
                                      levelsToIndexMap: Map[Any, Double]): RDD[(Double, Double)] = {
     // Calculate confusion matrix and output it as DataFrame
-    // TODO: We call cache in order to avoid a bug with catalyst where CMS seems to get stuck in a loop
-    // For future spark upgrade past 2.2.0, we should try to see if the cache() call can be removed
-    dataset.select(col(scoredLabelsColumnName).cast(DoubleType), col(labelColumnName))
-      .cache()
+    dataset.select(
+      inputColumn(scoredLabelsColumnName).cast(DoubleType).as(selectedPredictionColumn),
+      inputColumn(labelColumnName).as(selectedLabelColumn))
       .na
-      .drop(Array(scoredLabelsColumnName, labelColumnName))
+      .drop(Array(selectedPredictionColumn, selectedLabelColumn))
       .rdd
       .map {
         case Row(prediction: Double, label) => (prediction, levelsToIndexMap(label))
@@ -299,30 +441,47 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
                                        labelColumnName: String,
                                        scoresColumnName: String): RDD[(Double, Double)] = {
 
-    selectAndCastToDF(dataset, scoresColumnName, labelColumnName)
+    selectScoresAndLabels(dataset, labelColumnName, scoresColumnName, castLabel = true)
       .rdd
       .map {
-        case Row(prediction: Vector, label: Double) => (prediction(1), label)
+        case Row(prediction: Vector, label: Double) =>
+          (ComputeModelStatistics.getPositiveClassScore(prediction, scoresColumnName), label)
         case Row(prediction: Double, label: Double) => (prediction, label)
         case _ => throw new Exception(s"Error: prediction and label columns invalid or missing")
       }
   }
 
   private def getScoresAndLabels(dataset: Dataset[_],
-                         labelColumnName: String,
-                         scoresColumnName: String,
-                         levelsToIndexMap: Map[Any, Double]): RDD[(Double, Double)] = {
-    // TODO: We call cache in order to avoid a bug with catalyst where CMS seems to get stuck in a loop
-    // For future spark upgrade past 2.2.0, we should try to see if the cache() call can be removed
-    dataset.select(col(scoresColumnName), col(labelColumnName))
-      .cache()
-      .na
-      .drop(Array(scoresColumnName, labelColumnName))
+                                labelColumnName: String,
+                                scoresColumnName: String,
+                                levelsToIndexMap: Map[Any, Double]): RDD[(Double, Double)] = {
+    selectScoresAndLabels(dataset, labelColumnName, scoresColumnName, castLabel = false)
       .rdd
       .map {
-        case Row(prediction: Vector, label) => (prediction(1), levelsToIndexMap(label))
+        case Row(prediction: Vector, label) =>
+          (ComputeModelStatistics.getPositiveClassScore(prediction, scoresColumnName), levelsToIndexMap(label))
+        case Row(prediction: Double, label) => (prediction, levelsToIndexMap(label))
         case _ => throw new Exception(s"Error: prediction and label columns invalid or missing")
       }
+  }
+
+  private def selectScoresAndLabels(dataset: Dataset[_],
+                                   labelColumnName: String,
+                                   scoresColumnName: String,
+                                   castLabel: Boolean): DataFrame = {
+    val scores = if (dataset.schema(scoresColumnName).dataType == SQLDataTypes.VectorType)
+      inputColumn(scoresColumnName).as(selectedPredictionColumn)
+    else
+      inputColumn(scoresColumnName).cast(DoubleType).as(selectedPredictionColumn)
+    val label = if (castLabel) inputColumn(labelColumnName).cast(DoubleType).as(selectedLabelColumn)
+    else inputColumn(labelColumnName).as(selectedLabelColumn)
+    dataset.select(scores, label)
+      .na
+      .drop(Array(selectedPredictionColumn, selectedLabelColumn))
+  }
+
+  private def inputColumn(columnName: String): Column = {
+    col(s"`${columnName.replace("`", "``")}`")
   }
 
   private def getLevelsToIndexMap(levels: Array[_]): Map[Any, Double] = {
@@ -381,13 +540,28 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
     (microAvgAccuracy, microAvgPrecision, microAvgRecall, averageAccuracy, macroAveragedPrecision, macroAveragedRecall)
   }
 
-  private def getAUC(modelName: String,
-             dataset: Dataset[_],
-             labelColumnName: String,
-             scoresAndLabels: RDD[(Double, Double)]): Double = {
-    val binaryMetrics = new BinaryClassificationMetrics(scoresAndLabels,
-      MetricConstants.BinningThreshold)
+  private def getBinaryMetrics(modelName: String,
+                               dataset: Dataset[_],
+                               labelColumnName: String,
+                               scoresAndLabels: RDD[(Double, Double)]): (Double, Double) = {
+    withBinaryClassificationMetrics(scoresAndLabels) { binaryMetrics =>
+      (getAUC(modelName, dataset, labelColumnName, binaryMetrics), getAreaUnderPR(binaryMetrics))
+    }
+  }
 
+  private def getAUC(modelName: String,
+                     dataset: Dataset[_],
+                     labelColumnName: String,
+                     scoresAndLabels: RDD[(Double, Double)]): Double = {
+    withBinaryClassificationMetrics(scoresAndLabels) { binaryMetrics =>
+      getAUC(modelName, dataset, labelColumnName, binaryMetrics)
+    }
+  }
+
+  private def getAUC(modelName: String,
+                     dataset: Dataset[_],
+                     labelColumnName: String,
+                     binaryMetrics: BinaryClassificationMetrics): Double = {
     val spark = dataset.sparkSession
     import spark.implicits._
 
@@ -397,6 +571,28 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
     val auc = binaryMetrics.areaUnderROC()
     metricsLogger.logAUC(auc)
     auc
+  }
+
+  private def getAreaUnderPR(scoresAndLabels: RDD[(Double, Double)]): Double = {
+    withBinaryClassificationMetrics(scoresAndLabels) { binaryMetrics =>
+      getAreaUnderPR(binaryMetrics)
+    }
+  }
+
+  private def getAreaUnderPR(binaryMetrics: BinaryClassificationMetrics): Double = {
+    val areaUnderPR = binaryMetrics.areaUnderPR()
+    metricsLogger.logAreaUnderPR(areaUnderPR)
+    areaUnderPR
+  }
+
+  private def withBinaryClassificationMetrics[T](scoresAndLabels: RDD[(Double, Double)])
+                                                  (f: BinaryClassificationMetrics => T): T = {
+    val binaryMetrics = new BinaryClassificationMetrics(scoresAndLabels, MetricConstants.BinningThreshold)
+    try {
+      f(binaryMetrics)
+    } finally {
+      binaryMetrics.unpersist()
+    }
   }
 
   private def getBinaryAccuracyPrecisionRecall(confusionMatrix: Matrix): (Double, Double, Double) = {
@@ -436,37 +632,93 @@ class ComputeModelStatistics(override val uid: String) extends Transformer
     (labels, confusionMatrix)
   }
 
-  override def copy(extra: ParamMap): Transformer = new ComputeModelStatistics()
+  override def copy(extra: ParamMap): Transformer = defaultCopy(extra)
 
   override def transformSchema(schema: StructType): StructType = {
-    val (_, _, scoreValueKind) =
-      MetricUtils.getSchemaInfo(
-        schema,
-        if (isDefined(labelCol)) Some(getLabelCol) else None,
-        getEvaluationMetric)
-    val columns =
-      if (scoreValueKind == SchemaConstants.ClassificationKind) MetricConstants.ClassificationColumns
-      else if (scoreValueKind == SchemaConstants.RegressionKind) MetricConstants.RegressionColumns
+    val caseSensitive = SparkSession.getActiveSession
+      .orElse(SparkSession.getDefaultSession)
+      .exists(isCaseSensitive)
+    val (modelName, resolvedLabelColumnName, scoreValueKind) =
+      resolveSchemaInfo(schema, caseSensitive)
+    val inputColumns =
+      validateInputColumns(
+        schema, modelName, resolvedLabelColumnName, scoreValueKind, caseSensitive)
+    val labelLevels = getLabelLevels(schema, inputColumns.labelColumnName)
+    val (columns, validMetrics) =
+      if (scoreValueKind == SchemaConstants.ClassificationKind)
+        (getClassificationColumns(labelLevels), MetricConstants.ClassificationMetrics)
+      else if (scoreValueKind == SchemaConstants.RegressionKind)
+        (MetricConstants.RegressionColumns, MetricConstants.RegressionMetrics)
       else throwOnInvalidScoringKind(scoreValueKind)
-    getTransformedSchema(columns, scoreValueKind)
-
+    validateBinaryOnlyMetricSchema(labelLevels, scoreValueKind)
+    getTransformedSchema(columns, scoreValueKind, validMetrics)
   }
 
   private def throwOnInvalidScoringKind(scoreValueKind: String) = {
     throw new Exception(s"Error: unknown scoring kind $scoreValueKind")
   }
 
-  private def getTransformedSchema(columns: List[String], metricType: String) = {
+  private def throwOnInvalidEvaluationMetric(metric: String,
+                                             metricType: String,
+                                             validMetrics: Set[String]): Nothing = {
+    val validValues = (validMetrics + MetricConstants.AllSparkMetrics).toSeq.sorted.mkString(", ")
+    val metricTypeName = metricType match {
+      case SchemaConstants.ClassificationKind => "classification"
+      case SchemaConstants.RegressionKind => "regression"
+      case _ => metricType
+    }
+    throw new IllegalArgumentException(
+      s"ComputeModelStatistics evaluationMetric '$metric' is not valid for $metricTypeName data. " +
+        s"Valid values: $validValues.")
+  }
+
+  private def getLabelLevels(schema: StructType, labelColumnName: String): Option[Array[_]] = {
+    if (schema.fieldNames.contains(labelColumnName)) CategoricalUtilities.getLevels(schema, labelColumnName)
+    else None
+  }
+
+  private def getClassificationColumns(labelLevels: Option[Array[_]]): List[String] = {
+    // Keep the legacy common-metrics schema when cardinality is unknown or multiclass.
+    if (labelLevels.exists(_.length <= 2)) MetricConstants.BinaryClassificationColumns
+    else MetricConstants.ClassificationColumns
+  }
+
+  private def validateBinaryOnlyMetricSchema(labelLevels: Option[Array[_]],
+                                             scoreValueKind: String): Unit = {
+    val isBinaryOnlyClassificationMetric =
+      getEvaluationMetric == MetricConstants.AucSparkMetric ||
+        getEvaluationMetric == MetricConstants.AreaUnderROCMetric ||
+        getEvaluationMetric == MetricConstants.AreaUnderPRMetric
+    // Match runtime semantics: only SynapseML categorical metadata establishes label cardinality.
+    if (scoreValueKind == SchemaConstants.ClassificationKind &&
+        isBinaryOnlyClassificationMetric &&
+        labelLevels.exists(_.length > 2)) {
+      throw new IllegalArgumentException(getBinaryOnlyMetricMulticlassError(getEvaluationMetric))
+    }
+  }
+
+  private def getBinaryOnlyMetricMulticlassError(metric: String): String = metric match {
+    case MetricConstants.AucSparkMetric | MetricConstants.AreaUnderROCMetric =>
+      "Error: AUC is not available for multiclass case"
+    case MetricConstants.AreaUnderPRMetric =>
+      "Error: areaUnderPR is not available for multiclass case"
+    case _ =>
+      throw new IllegalArgumentException(s"Error: $metric is not a classification metric")
+  }
+
+  private def getTransformedSchema(columns: List[String],
+                                   metricType: String,
+                                   validMetrics: Set[String]): StructType = {
     getEvaluationMetric match {
       case allMetrics if allMetrics == MetricConstants.AllSparkMetrics ||
                          allMetrics == MetricConstants.ClassificationMetricsName ||
                          allMetrics == MetricConstants.RegressionMetricsName =>
         StructType(columns.map(StructField(_, DoubleType)))
-      case metric: String if MetricConstants.MetricToColumnName.contains(metric) &&
-                             columns.contains(MetricConstants.MetricToColumnName(metric)) =>
+      case metric: String if validMetrics.contains(metric) &&
+                             MetricConstants.MetricToColumnName.contains(metric) =>
         StructType(Array(StructField(MetricConstants.MetricToColumnName(metric), DoubleType)))
       case default =>
-        throw new Exception(s"Error: $default is not a $metricType metric")
+        throwOnInvalidEvaluationMetric(default, metricType, validMetrics)
     }
   }
 }
@@ -499,6 +751,12 @@ class MetricsLogger(uid: String) {
 
   def logAUC(auc: Double): Unit = {
     val metrics = MetricData.create(Map(MetricConstants.AucColumnName -> auc), "AUC Metric", uid)
+    logger.info(metrics)
+  }
+
+  def logAreaUnderPR(areaUnderPR: Double): Unit = {
+    val metrics = MetricData.create(
+      Map(MetricConstants.AreaUnderPRColumnName -> areaUnderPR), "AreaUnderPR Metric", uid)
     logger.info(metrics)
   }
 

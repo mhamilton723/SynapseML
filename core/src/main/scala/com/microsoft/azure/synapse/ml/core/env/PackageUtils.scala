@@ -9,7 +9,7 @@ import com.microsoft.azure.synapse.ml.build.BuildInfo
  * Centralized values for package repositories and coordinates (mostly used by test pipeline frameworks)
  */
 object PackageUtils {
-  private val SparkMLRepository = "https://mmlspark.azureedge.net/maven"
+  private val SparkMLRepository = "https://mmlspark.blob.core.windows.net/maven"
   private val SonatypeSnapshotsRepository = "https://oss.sonatype.org/content/repositories/snapshots"
 
   val ScalaVersionSuffix: String = BuildInfo.scalaVersion.split(".".toCharArray).dropRight(1).mkString(".")
@@ -21,7 +21,7 @@ object PackageUtils {
   // Use a fixed version for local testing
   // val PackageMavenCoordinate = s"$PackageGroup:$PackageName:1.0.9"
 
-  private val AvroCoordinate = "org.apache.spark:spark-avro_2.12:3.4.1"
+  private val AvroCoordinate = "org.apache.spark:spark-avro_2.12:3.5.0"
   val PackageRepository: String = SparkMLRepository
 
   // If testing onnx package with snapshots repo, make sure to switch to using

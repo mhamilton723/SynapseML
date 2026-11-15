@@ -7,34 +7,54 @@ import com.microsoft.azure.synapse.ml.lightgbm.swig.SwigUtils
 import com.microsoft.azure.synapse.ml.lightgbm._
 import com.microsoft.ml.lightgbm._
 import org.apache.spark.sql._
-import org.slf4j.Logger
+import org.slf4j.{Logger, LoggerFactory}
 
 
 object ReferenceDatasetUtils {
+  private val Log = LoggerFactory.getLogger(getClass)
+
   def createReferenceDatasetFromSample(datasetParams: String,
                                        featuresCol: String,
                                        numRows: Long,
                                        numCols: Int,
                                        sampledRowData: Array[Row],
+                                       featureNames: Option[Array[String]],
                                        measures: InstrumentationMeasures,
                                        log: Logger): Array[Byte] = {
     log.info(s"Creating reference training dataset with ${sampledRowData.length} samples and config: $datasetParams")
 
-    // Pre-create allocated native pointers so it's easy to clean them up
-    val datasetVoidPtr = lightgbmlib.voidpp_handle()
     val lenPtr = lightgbmlib.new_intp()
     val bufferHandlePtr = lightgbmlib.voidpp_handle()
-
     val sampledData = SampledData(sampledRowData.length, numCols)
+
     try {
-      // create properly formatted sampled data
       measures.markSamplingStart()
       sampledRowData.zipWithIndex.foreach({case (row, index) => sampledData.pushRow(row, index, featuresCol)})
       measures.markSamplingStop()
 
-      // Create dataset from samples
-      // 1. Generate the dataset for features
-      val datasetVoidPtr = lightgbmlib.voidpp_handle()
+      val datasetHandle = createDatasetFromSamples(sampledData, numCols, numRows, datasetParams)
+      try {
+        setFeatureNamesIfProvided(datasetHandle, featureNames, numCols, log)
+        serializeReference(datasetHandle, bufferHandlePtr, lenPtr, log)
+      } finally {
+        // Free unconditionally so a failure while naming or serializing cannot leak the native
+        // Dataset. Deliberately not validated: throwing here would mask the original failure.
+        lightgbmlib.LGBM_DatasetFree(datasetHandle)
+      }
+    } finally {
+      sampledData.delete()
+      lightgbmlib.delete_voidpp(bufferHandlePtr)
+      lightgbmlib.delete_intp(lenPtr)
+    }
+  }
+
+  private def createDatasetFromSamples(sampledData: SampledData,
+                                       numCols: Int,
+                                       numRows: Long,
+                                       datasetParams: String): SWIGTYPE_p_void = {
+    val datasetVoidPtr = lightgbmlib.voidpp_handle()
+    try {
+      LightGBMUtils.registerNativeOmpThreads(NativeOmpCallSite.SampledColumnDataset, datasetParams)
       LightGBMUtils.validate(lightgbmlib.LGBM_DatasetCreateFromSampledColumn(
         sampledData.getSampleData,
         sampledData.getSampleIndices,
@@ -45,29 +65,41 @@ object ReferenceDatasetUtils {
         numRows,
         datasetParams,
         datasetVoidPtr), "Dataset create from samples")
-
-
-      // 2. Serialize the raw dataset to a native buffer
-      val datasetHandle: SWIGTYPE_p_void = lightgbmlib.voidpp_value(datasetVoidPtr)
-      LightGBMUtils.validate(lightgbmlib.LGBM_DatasetSerializeReferenceToBinary(
-        datasetHandle,
-        bufferHandlePtr,
-        lenPtr), "Serialize ref")
-      val bufferLen: Int = lightgbmlib.intp_value(lenPtr)
-      log.info(s"Created serialized reference dataset of length $bufferLen")
-
-      // The dataset is now serialized to a buffer, so we don't need original
-      LightGBMUtils.validate(lightgbmlib.LGBM_DatasetFree(datasetHandle), "Free Dataset")
-
-      // This will also free the buffer
-      toByteArray(bufferHandlePtr, bufferLen)
-    }
-    finally {
-      sampledData.delete()
+      lightgbmlib.voidpp_value(datasetVoidPtr)
+    } finally {
+      // Frees the void** container only. The Dataset it points at is freed by LGBM_DatasetFree.
       lightgbmlib.delete_voidpp(datasetVoidPtr)
-      lightgbmlib.delete_voidpp(bufferHandlePtr)
-      lightgbmlib.delete_intp(lenPtr)
     }
+  }
+
+  private def setFeatureNamesIfProvided(datasetHandle: SWIGTYPE_p_void,
+                                        featureNames: Option[Array[String]],
+                                        numCols: Int,
+                                        log: Logger): Unit = {
+    featureNames.foreach { names =>
+      if (names.length != numCols) {
+        // LGBM_DatasetSetFeatureNames reads numCols entries from the array, so a shorter array
+        // would be an out-of-bounds native read. Skip naming rather than risk it; LightGBM then
+        // falls back to its own generated names, which is the behavior prior to this feature.
+        log.warn(s"Skipping feature names on reference dataset: got ${names.length} names " +
+          s"for $numCols feature columns.")
+      } else if (names.nonEmpty) {
+        log.info(s"Setting ${names.length} feature names on reference dataset")
+        LightGBMUtils.validate(lightgbmlib.LGBM_DatasetSetFeatureNames(datasetHandle, names, numCols),
+          "Dataset set feature names")
+      }
+    }
+  }
+
+  private def serializeReference(datasetHandle: SWIGTYPE_p_void,
+                                 bufferHandlePtr: SWIGTYPE_p_p_void,
+                                 lenPtr: SWIGTYPE_p_int,
+                                 log: Logger): Array[Byte] = {
+    LightGBMUtils.validate(lightgbmlib.LGBM_DatasetSerializeReferenceToBinary(
+      datasetHandle, bufferHandlePtr, lenPtr), "Serialize ref")
+    val bufferLen: Int = lightgbmlib.intp_value(lenPtr)
+    log.info(s"Created serialized reference dataset of length $bufferLen")
+    toByteArray(bufferHandlePtr, bufferLen)
   }
 
   def getInitializedReferenceDataset(ctx: PartitionTaskContext): LightGBMDataset = {
@@ -82,18 +114,82 @@ object ReferenceDatasetUtils {
       count,
       datasetParams)
 
-    // Initialize the dataset for streaming (allocates arrays mostly)
-    val maxOmpThreads = ctx.trainingParams.executionParams.maxStreamingOMPThreads
-    LightGBMUtils.validate(lightgbmlib.LGBM_DatasetInitStreaming(lightGBMDataset.datasetPtr,
-      ctx.trainingCtx.hasWeightsAsInt,
-      ctx.trainingCtx.hasInitialScoresAsInt,
-      ctx.trainingCtx.hasGroupsAsInt,
-      ctx.trainingParams.getNumClass,
-      ctx.executorPartitionCount,
-      maxOmpThreads),
-      "LGBM_DatasetInitStreaming")
+    initializeOwnedDataset(lightGBMDataset) {
+      DatasetUtils.validateFeatureSize(lightGBMDataset.numFeature(), ctx.trainingCtx.numCols)
 
-    lightGBMDataset.setFeatureNames(ctx.trainingCtx.featureNames, ctx.trainingCtx.numCols)
+      // Initialize the dataset for streaming (allocates arrays mostly)
+      val configuredMaxOmpThreads = ctx.trainingParams.executionParams.maxStreamingOMPThreads
+      val maxOmpThreads = streamingOmpAllocationBound(
+        configuredMaxThreads = configuredMaxOmpThreads,
+        configuredNumThreads = ctx.trainingParams.executionParams.numThreads,
+        externalThreads = ctx.executorPartitionCount)
+      if (ctx.trainingParams.generalParams.verbosity > 1) {
+        Log.info(
+          s"Initializing streaming Dataset: executor=${LightGBMUtils.getExecutorId}, " +
+            s"partition=${ctx.partitionId}, task=${ctx.taskId}, rows=$count, " +
+            s"localPartitions=${ctx.networkTopologyInfo.executorPartitionIdList.sorted.mkString(",")}, " +
+            s"externalThreads=${ctx.executorPartitionCount}, " +
+            s"configuredMaxStreamingOMPThreads=$configuredMaxOmpThreads, allocationBound=$maxOmpThreads")
+      }
+      LightGBMUtils.validate(lightgbmlib.LGBM_DatasetInitStreaming(lightGBMDataset.datasetPtr,
+        ctx.trainingCtx.hasWeightsAsInt,
+        ctx.trainingCtx.hasInitialScoresAsInt,
+        ctx.trainingCtx.hasGroupsAsInt,
+        ctx.trainingParams.getNumClass,
+        ctx.executorPartitionCount,
+        maxOmpThreads),
+        "LGBM_DatasetInitStreaming")
+
+      lightGBMDataset.setFeatureNames(ctx.trainingCtx.featureNames, ctx.trainingCtx.numCols)
+    }
+  }
+
+  private[lightgbm] def streamingOmpAllocationBound(configuredMaxThreads: Int,
+                                                    configuredNumThreads: Int,
+                                                    externalThreads: Int): Int = {
+    LightGBMUtils.streamingOmpAllocationBound(
+      externalThreads = externalThreads,
+      configuredMaxThreads = configuredMaxThreads,
+      configuredNumThreads = configuredNumThreads,
+      ompNumThreads = Option(System.getenv("OMP_NUM_THREADS")),
+      affinityCount = LightGBMUtils.linuxProcessAffinityCount(),
+      osProcessorCount = LightGBMUtils.osReportedProcessorCount(),
+      availableProcessors = Runtime.getRuntime.availableProcessors(),
+      registeredMaxThreads = LightGBMUtils.nativeOmpThreadHighWaterMark,
+      warn = message => Log.warn(message),
+      dynamicThreads = LightGBMUtils.ompDynamicEnabled(
+        Option(System.getenv("OMP_DYNAMIC")), Option(System.getenv("OMP_DYNAMIC_ALL"))),
+      ompThreadLimit = LightGBMUtils.enforcedOmpThreadLimit(
+        Option(System.getProperty("os.name")).getOrElse(""), Option(System.getenv("OMP_THREAD_LIMIT"))),
+      ompNumThreadsAll = Option(System.getenv("OMP_NUM_THREADS_ALL")))
+  }
+
+  private[lightgbm] def streamingOmpAllocationBound(externalThreads: Int,
+                                                    configuredMaxThreads: Int,
+                                                    configuredNumThreads: Int,
+                                                    ompNumThreads: Option[String],
+                                                    affinityCount: Option[Int],
+                                                    osProcessorCount: Option[Int],
+                                                    availableProcessors: Int,
+                                                    registeredMaxThreads: Int,
+                                                    warn: String => Unit): Int =
+    LightGBMUtils.streamingOmpAllocationBound(
+      externalThreads,
+      configuredMaxThreads,
+      configuredNumThreads,
+      ompNumThreads,
+      affinityCount,
+      osProcessorCount,
+      availableProcessors,
+      registeredMaxThreads,
+      warn)
+
+  private[lightgbm] def initializeOwnedDataset(dataset: LightGBMDataset)
+                                                (initialization: => Unit): LightGBMDataset = {
+    NetworkManager.withCleanupOnFailurePreservingPrimary(dataset.close()) {
+      initialization
+      dataset
+    }
   }
 
   private def toByteArray(buffer: SWIGTYPE_p_p_void, bufferLen: Int): Array[Byte] = {
@@ -123,17 +219,25 @@ object ReferenceDatasetUtils {
                                           datasetParams: String): LightGBMDataset = {
     // Convert byte array to native memory
     val datasetVoidPtr = lightgbmlib.voidpp_handle()
-    val nativeByteArray = SwigUtils.byteArrayToNative(serializedDataset)
-    LightGBMUtils.validate(lightgbmlib.LGBM_DatasetCreateFromSerializedReference( //scalastyle:ignore token
-      lightgbmlib.byte_to_voidp_ptr(nativeByteArray),
-      serializedDataset.length,
-      rowCount,
-      0, // Always zero since we will be using InitStreaming to do allocation
-      datasetParams,
-      datasetVoidPtr), "Dataset create from reference")
+    try {
+      val nativeByteArray = SwigUtils.byteArrayToNative(serializedDataset)
+      try {
+        LightGBMUtils.registerNativeOmpThreads(NativeOmpCallSite.SerializedReferenceDataset, datasetParams)
+        LightGBMUtils.validate(lightgbmlib.LGBM_DatasetCreateFromSerializedReference( //scalastyle:ignore token
+          lightgbmlib.byte_to_voidp_ptr(nativeByteArray),
+          serializedDataset.length,
+          rowCount,
+          0, // Always zero since we will be using InitStreaming to do allocation
+          datasetParams,
+          datasetVoidPtr), "Dataset create from reference")
 
-    val datasetPtr: SWIGTYPE_p_void = lightgbmlib.voidpp_value(datasetVoidPtr)
-    lightgbmlib.delete_voidpp(datasetVoidPtr)
-    new LightGBMDataset(datasetPtr)
+        val datasetPtr: SWIGTYPE_p_void = lightgbmlib.voidpp_value(datasetVoidPtr)
+        new LightGBMDataset(datasetPtr)
+      } finally {
+        lightgbmlib.delete_byteArray(nativeByteArray)
+      }
+    } finally {
+      lightgbmlib.delete_voidpp(datasetVoidPtr)
+    }
   }
 }

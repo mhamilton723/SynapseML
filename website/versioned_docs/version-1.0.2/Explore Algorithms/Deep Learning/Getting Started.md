@@ -27,7 +27,7 @@ pip install synapseml==1.0.2
 An alternative is installing the SynapseML jar package in library management section, by adding:
 ```
 Coordinate: com.microsoft.azure:synapseml_2.12:1.0.2
-Repository: https://mmlspark.azureedge.net/maven
+Repository: https://mmlspark.blob.core.windows.net/maven
 ```
 :::note
 If you install the jar package, follow the first two cells of this [sample](../Quickstart%20-%20Fine-tune%20a%20Vision%20Classifier#environment-setup----reinstall-horovod-based-on-new-version-of-pytorch)
@@ -38,5 +38,5 @@ to ensure horovod recognizes SynapseML.
 
 You could follow the rest of this [sample](../Quickstart%20-%20Fine-Tune a Vision Classifier) and have a try on your own dataset.
 
-Supported models (`backbone` parameter for `DeepVisionClassifer`) should be string format of [Torchvision-supported models](https://github.com/pytorch/vision/blob/v0.12.0/torchvision/models/__init__.py);
+Supported models (`backbone` parameter for `DeepVisionClassifier`) should be string format of [Torchvision-supported models](https://github.com/pytorch/vision/blob/v0.12.0/torchvision/models/__init__.py);
 You could also check by running `backbone in torchvision.models.__dict__`.

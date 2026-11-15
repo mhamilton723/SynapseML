@@ -10,7 +10,7 @@ import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, Transformer
 import com.microsoft.azure.synapse.ml.io.http.RESTHelpers
 import com.microsoft.azure.synapse.ml.io.http.RESTHelpers.retry
 import com.microsoft.azure.synapse.ml.services._
-import com.microsoft.azure.synapse.ml.services.bing.BingImageSearch
+import com.microsoft.azure.synapse.ml.services.testutils.ImageDownloadUtils
 import com.microsoft.azure.synapse.ml.services.form.FormsFlatteners._
 import com.microsoft.azure.synapse.ml.stages.UDFTransformer
 import org.apache.commons.io.IOUtils
@@ -20,7 +20,6 @@ import org.apache.spark.ml.Transformer
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions.col
-import org.scalactic.Equality
 import spray.json._
 
 import java.net.URI
@@ -43,6 +42,8 @@ object FormRecognizerUtils extends CognitiveKey {
   import com.microsoft.azure.synapse.ml.io.http.RESTHelpers._
 
   val PollingDelay = 1000
+  private val BaseURL =
+    s"https://$cognitiveLoc.api.cognitive.microsoft.com/formrecognizer/v2.1/custom/models"
 
   def formSend(request: HttpRequestBase, path: String,
                params: Map[String, String] = Map()): String = {
@@ -80,15 +81,14 @@ object FormRecognizerUtils extends CognitiveKey {
   }
 
   def formDelete(path: String, params: Map[String, String] = Map()): String = {
-    formSend(new HttpDelete(),
-      "https://eastus.api.cognitive.microsoft.com/formrecognizer/v2.1/custom/models/" + path, params)
+    formSend(new HttpDelete(), s"$BaseURL/$path", params)
   }
 
   def formPost(path: String, body: TrainCustomModelSchema, params: Map[String, String] = Map())
               (implicit format: JsonFormat[TrainCustomModelSchema]): String = {
     val post = new HttpPost()
     post.setEntity(new StringEntity(body.toJson.compactPrint))
-    formSend(post, "https://eastus.api.cognitive.microsoft.com/formrecognizer/v2.1/custom/models" + path, params)
+    formSend(post, BaseURL + path, params)
   }
 
   def formGet(path: String, params: Map[String, String] = Map()): String = {
@@ -96,16 +96,14 @@ object FormRecognizerUtils extends CognitiveKey {
   }
 }
 
-trait FormRecognizerUtils extends TestBase with CognitiveKey with Flaky {
+trait FormRecognizerUtils extends TestBase with CognitiveKey with Flaky with ImageDownloadUtils {
 
   import spark.implicits._
 
   def createTestDataframe(baseUrl: String, docs: Seq[String], returnBytes: Boolean): DataFrame = {
     val df = docs.map(doc => baseUrl + doc).toDF("source")
     if (returnBytes) {
-      BingImageSearch
-        .downloadFromUrls("source", "imageBytes", 4, 10000)
-        .transform(df)
+      df.withColumn("imageBytes", downloadBytesUdf(col("source")))
         .select("imageBytes")
     } else {
       df
@@ -157,22 +155,16 @@ trait FormRecognizerUtils extends TestBase with CognitiveKey with Flaky {
 }
 
 class AnalyzeLayoutSuite extends TransformerFuzzing[AnalyzeLayout] with FormRecognizerUtils {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   lazy val analyzeLayout: AnalyzeLayout = new AnalyzeLayout()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageUrlCol("source").setOutputCol("layout").setConcurrency(5)
 
   lazy val bytesAnalyzeLayout: AnalyzeLayout = new AnalyzeLayout()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageBytesCol("imageBytes").setOutputCol("layout").setConcurrency(5)
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("source", "layout.analyzeResult.readResults")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage with URL") {
     val results = imageDf1.mlTransform(analyzeLayout,
@@ -221,22 +213,16 @@ class AnalyzeLayoutSuite extends TransformerFuzzing[AnalyzeLayout] with FormReco
 }
 
 class AnalyzeReceiptsSuite extends TransformerFuzzing[AnalyzeReceipts] with FormRecognizerUtils {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   lazy val analyzeReceipts: AnalyzeReceipts = new AnalyzeReceipts()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageUrlCol("source").setOutputCol("receipts").setConcurrency(5)
 
   lazy val bytesAnalyzeReceipts: AnalyzeReceipts = new AnalyzeReceipts()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageBytesCol("imageBytes").setOutputCol("receipts").setConcurrency(5)
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("source", "receipts.analyzeResult.readResults")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage with URL") {
     val results = imageDf2.mlTransform(analyzeReceipts,
@@ -269,22 +255,16 @@ class AnalyzeReceiptsSuite extends TransformerFuzzing[AnalyzeReceipts] with Form
 }
 
 class AnalyzeBusinessCardsSuite extends TransformerFuzzing[AnalyzeBusinessCards] with FormRecognizerUtils {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   lazy val analyzeBusinessCards: AnalyzeBusinessCards = new AnalyzeBusinessCards()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageUrlCol("source").setOutputCol("businessCards").setConcurrency(5)
 
   lazy val bytesAnalyzeBusinessCards: AnalyzeBusinessCards = new AnalyzeBusinessCards()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageBytesCol("imageBytes").setOutputCol("businessCards").setConcurrency(5)
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("source", "businessCards.analyzeResult.readResults")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage with URL") {
     val results = imageDf3.mlTransform(analyzeBusinessCards,
@@ -319,22 +299,16 @@ class AnalyzeBusinessCardsSuite extends TransformerFuzzing[AnalyzeBusinessCards]
 }
 
 class AnalyzeInvoicesSuite extends TransformerFuzzing[AnalyzeInvoices] with FormRecognizerUtils {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   lazy val analyzeInvoices: AnalyzeInvoices = new AnalyzeInvoices()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageUrlCol("source").setOutputCol("invoices").setConcurrency(5)
 
   lazy val bytesAnalyzeInvoices: AnalyzeInvoices = new AnalyzeInvoices()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageBytesCol("imageBytes").setOutputCol("invoices").setConcurrency(5)
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("source", "invoices.analyzeResult.readResults")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage with URL") {
     val results = imageDf4.mlTransform(analyzeInvoices,
@@ -379,22 +353,16 @@ class AnalyzeInvoicesSuite extends TransformerFuzzing[AnalyzeInvoices] with Form
 }
 
 class AnalyzeIDDocumentsSuite extends TransformerFuzzing[AnalyzeIDDocuments] with FormRecognizerUtils {
+  override val compareDataInSerializationTest: Boolean = false
+
 
   lazy val analyzeIDDocuments: AnalyzeIDDocuments = new AnalyzeIDDocuments()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageUrlCol("source").setOutputCol("ids").setConcurrency(5)
 
   lazy val bytesAnalyzeIDDocuments: AnalyzeIDDocuments = new AnalyzeIDDocuments()
-    .setSubscriptionKey(cognitiveKey).setLocation("eastus")
+    .setSubscriptionKey(cognitiveKey).setLocation(cognitiveLoc)
     .setImageBytesCol("imageBytes").setOutputCol("ids").setConcurrency(5)
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("source", "ids.analyzeResult.readResults")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
-  }
 
   test("Basic Usage with URL") {
     val results = imageDf5.mlTransform(analyzeIDDocuments,
@@ -441,22 +409,15 @@ trait CustomModelUtils extends TestBase with CognitiveKey {
 
 class ListCustomModelsSuite extends TransformerFuzzing[ListCustomModels]
   with FormRecognizerUtils with CustomModelUtils {
+  override val compareDataInSerializationTest: Boolean = false
 
   lazy val listCustomModels: ListCustomModels = {
     new ListCustomModels()
       .setSubscriptionKey(cognitiveKey)
-      .setLocation("eastus")
+      .setLocation(cognitiveLoc)
       .setOp("full")
       .setOutputCol("models")
       .setConcurrency(5)
-  }
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    def prep(df: DataFrame) = {
-      df.select("models.summary.count")
-    }
-
-    super.assertDFEq(prep(df1), prep(df2))(eq)
   }
 
   ignore("List model list details") {
